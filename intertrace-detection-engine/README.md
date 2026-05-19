@@ -3,8 +3,9 @@
 Low-latency architecture:
 
 1. Go gateway (`POST /v1/detect`)
-2. Python NeMo guardrail detector (`POST /detect` on 8001)
-3. Python Presidio-style PII detector (`POST /detect` on 8002)
+2. Go chat gateway compatibility route (`POST /v1/chat/completions`)
+3. Python NeMo guardrail detector (`POST /detect` on 8001)
+4. Python Presidio-style PII detector (`POST /detect` on 8002)
 
 The gateway calls both detectors concurrently and returns one unified detection response.
 
@@ -15,6 +16,8 @@ intertrace-detection-engine/
   go-gateway/
     main.go
     main_test.go
+    chat.go
+    chat_test.go
     go.mod
     Dockerfile
   nemo-guardrails-service/
@@ -74,6 +77,48 @@ intertrace-detection-engine/
   }
 }
 ```
+
+### Chat completions compatibility route
+
+`POST /v1/chat/completions`
+
+Supports provider routing to:
+
+- `openai`
+- `anthropic`
+- `gemini`
+
+Provider can be set explicitly (`provider`) or inferred from `model`.
+
+Request example:
+
+```json
+{
+  "org_id": "string",
+  "project_id": "string",
+  "asset_id": "string",
+  "session_id": "string",
+  "provider": "openai",
+  "model": "gpt-4o-mini",
+  "messages": [
+    {"role": "system", "content": "You are helpful."},
+    {"role": "user", "content": "Summarize zero trust in 2 bullets."}
+  ],
+  "temperature": 0.2,
+  "max_tokens": 256,
+  "context": {
+    "environment": "production",
+    "source": "chat"
+  }
+}
+```
+
+Behavior:
+
+- gateway runs detection first
+- blocked requests return `403`
+- allowed/review requests are forwarded to the selected upstream LLM provider
+- response shape is OpenAI-compatible and includes `detection` metadata
 
 ## Decision and Fail-Closed Logic
 
@@ -142,11 +187,18 @@ PORT=8080
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
 DETECTION_TIMEOUT_MS=2500
+LLM_TIMEOUT_MS=45000
 FAIL_CLOSED=true
 ENABLE_NEMO=true
 ENABLE_PRESIDIO=true
 DEBUG_DETECTION=false
 MAX_REQUEST_BODY_BYTES=1048576
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+OPENAI_API_URL=https://api.openai.com/v1/chat/completions
+ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages
+GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models
 ```
 
 Presidio service:
@@ -246,6 +298,60 @@ Expected behavior:
 - detector statuses show `timeout` for delayed services
 - if one service still succeeds, final decision still returned
 - if both timeout/error and `FAIL_CLOSED=true`, final result is blocked with fail-closed reason
+
+### Chat completions (OpenAI)
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id":"org-1",
+    "project_id":"proj-1",
+    "asset_id":"asset-1",
+    "session_id":"sess-chat-openai",
+    "provider":"openai",
+    "model":"gpt-4o-mini",
+    "messages":[
+      {"role":"system","content":"You are concise."},
+      {"role":"user","content":"Give me one sentence about SOC 2."}
+    ],
+    "context":{"source":"chat","environment":"production"}
+  }' | jq
+```
+
+### Chat completions (Anthropic)
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id":"org-1",
+    "project_id":"proj-1",
+    "asset_id":"asset-1",
+    "session_id":"sess-chat-anthropic",
+    "provider":"anthropic",
+    "model":"claude-3-5-sonnet-20241022",
+    "messages":[{"role":"user","content":"Explain TLS in plain English."}],
+    "context":{"source":"chat","environment":"production"}
+  }' | jq
+```
+
+### Chat completions (Gemini)
+
+```bash
+curl -s http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id":"org-1",
+    "project_id":"proj-1",
+    "asset_id":"asset-1",
+    "session_id":"sess-chat-gemini",
+    "provider":"gemini",
+    "model":"gemini-1.5-flash",
+    "messages":[{"role":"user","content":"List two steps for incident response triage."}],
+    "context":{"source":"chat","environment":"production"}
+  }' | jq
+```
 
 ## Railway Deployment Notes
 

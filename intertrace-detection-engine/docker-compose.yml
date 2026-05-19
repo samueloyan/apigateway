@@ -12,6 +12,13 @@ services:
       ENABLE_PRESIDIO: ${ENABLE_PRESIDIO:-true}
       DEBUG_DETECTION: ${DEBUG_DETECTION:-false}
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-45000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      OPENAI_API_URL: ${OPENAI_API_URL:-https://api.openai.com/v1/chat/completions}
+      ANTHROPIC_API_URL: ${ANTHROPIC_API_URL:-https://api.anthropic.com/v1/messages}
+      GEMINI_API_BASE_URL: ${GEMINI_API_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/models}
       PORT: 8080
     depends_on:
       - nemo-guardrails
