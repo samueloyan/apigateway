@@ -18,17 +18,24 @@ import (
 )
 
 const (
-	defaultNemoURL      = "http://localhost:8001/detect"
-	defaultPresidioURL  = "http://localhost:8002/detect"
-	defaultTimeoutMS    = 2500
-	defaultFailClosed   = true
-	defaultEnableNemo   = true
-	defaultEnablePii    = true
-	defaultDebugMode    = false
-	defaultMaxBodyBytes = int64(1 * 1024 * 1024)
-	defaultGatewayPort  = "8080"
-	requestIDHeaderName = "X-Request-ID"
-	failClosedReason    = "All detection engines failed. Request blocked due to fail closed policy."
+	defaultNemoURL         = "http://localhost:8001/detect"
+	defaultPresidioURL     = "http://localhost:8002/detect"
+	defaultOpenAIURL       = "https://api.openai.com/v1/chat/completions"
+	defaultAnthropicURL    = "https://api.anthropic.com/v1/messages"
+	defaultGeminiBaseURL   = "https://generativelanguage.googleapis.com/v1beta/models"
+	defaultTimeoutMS       = 2500
+	defaultLLMTimeoutMS    = 45000
+	defaultFailClosed      = true
+	defaultEnableNemo      = true
+	defaultEnablePii       = true
+	defaultDebugMode       = false
+	defaultMaxBodyBytes    = int64(1 * 1024 * 1024)
+	defaultGatewayPort     = "8080"
+	requestIDHeaderName    = "X-Request-ID"
+	failClosedReason       = "All detection engines failed. Request blocked due to fail closed policy."
+	defaultProviderOpenAI  = "openai"
+	defaultProviderAnthrop = "anthropic"
+	defaultProviderGemini  = "gemini"
 )
 
 var riskOrder = map[string]int{
@@ -43,6 +50,13 @@ type GatewayConfig struct {
 	NemoServiceURL   string
 	PresidioURL      string
 	DetectionTimeout time.Duration
+	LLMTimeout       time.Duration
+	OpenAIURL        string
+	AnthropicURL     string
+	GeminiBaseURL    string
+	OpenAIAPIKey     string
+	AnthropicAPIKey  string
+	GeminiAPIKey     string
 	FailClosed       bool
 	EnableNemo       bool
 	EnablePresidio   bool
@@ -120,6 +134,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", gateway.healthHandler)
 	mux.HandleFunc("/v1/detect", gateway.detectHandler)
+	mux.HandleFunc("/v1/chat/completions", gateway.chatCompletionsHandler)
 
 	port := strings.TrimSpace(getEnv("PORT", defaultGatewayPort))
 	addr := ":" + port
@@ -128,11 +143,15 @@ func main() {
 		slog.String("nemo_service_url", cfg.NemoServiceURL),
 		slog.String("presidio_service_url", cfg.PresidioURL),
 		slog.Int("detection_timeout_ms", int(cfg.DetectionTimeout/time.Millisecond)),
+		slog.Int("llm_timeout_ms", int(cfg.LLMTimeout/time.Millisecond)),
 		slog.Int64("max_body_bytes", cfg.MaxBodyBytes),
 		slog.Bool("fail_closed", cfg.FailClosed),
 		slog.Bool("enable_nemo", cfg.EnableNemo),
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
 		slog.Bool("debug_detection", cfg.DebugDetection),
+		slog.Bool("openai_configured", cfg.OpenAIAPIKey != ""),
+		slog.Bool("anthropic_configured", cfg.AnthropicAPIKey != ""),
+		slog.Bool("gemini_configured", cfg.GeminiAPIKey != ""),
 	)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -486,6 +505,10 @@ func loadConfig() GatewayConfig {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultTimeoutMS
 	}
+	llmTimeoutMs := parseEnvInt("LLM_TIMEOUT_MS", defaultLLMTimeoutMS)
+	if llmTimeoutMs <= 0 {
+		llmTimeoutMs = defaultLLMTimeoutMS
+	}
 	maxBodyBytes := parseEnvInt64("MAX_REQUEST_BODY_BYTES", defaultMaxBodyBytes)
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = defaultMaxBodyBytes
@@ -495,6 +518,13 @@ func loadConfig() GatewayConfig {
 		NemoServiceURL:   getEnv("NEMO_SERVICE_URL", defaultNemoURL),
 		PresidioURL:      getEnv("PRESIDIO_SERVICE_URL", defaultPresidioURL),
 		DetectionTimeout: time.Duration(timeoutMs) * time.Millisecond,
+		LLMTimeout:       time.Duration(llmTimeoutMs) * time.Millisecond,
+		OpenAIURL:        getEnv("OPENAI_API_URL", defaultOpenAIURL),
+		AnthropicURL:     getEnv("ANTHROPIC_API_URL", defaultAnthropicURL),
+		GeminiBaseURL:    getEnv("GEMINI_API_BASE_URL", defaultGeminiBaseURL),
+		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		AnthropicAPIKey:  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
+		GeminiAPIKey:     strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
 		EnablePresidio:   parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),

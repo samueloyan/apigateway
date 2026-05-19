@@ -2,9 +2,9 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 COPY go.mod ./
-COPY main.go ./
+COPY *.go ./
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o gateway main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o gateway .
 
 FROM alpine:3.20
 
