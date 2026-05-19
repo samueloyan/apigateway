@@ -1,0 +1,42 @@
+services:
+  go-gateway:
+    build:
+      context: ./go-gateway
+    container_name: go-gateway
+    environment:
+      DETECTION_TIMEOUT_MS: ${DETECTION_TIMEOUT_MS:-2500}
+      NEMO_SERVICE_URL: ${NEMO_SERVICE_URL:-http://nemo-guardrails:8001/detect}
+      PRESIDIO_SERVICE_URL: ${PRESIDIO_SERVICE_URL:-http://presidio:8002/detect}
+      FAIL_CLOSED: ${FAIL_CLOSED:-true}
+      ENABLE_NEMO: ${ENABLE_NEMO:-true}
+      ENABLE_PRESIDIO: ${ENABLE_PRESIDIO:-true}
+      PORT: 8080
+    depends_on:
+      - nemo-guardrails
+      - presidio
+    ports:
+      - "8080:8080"
+    networks:
+      - detection-network
+
+  nemo-guardrails:
+    build:
+      context: ./nemo-guardrails-service
+    container_name: nemo-guardrails
+    ports:
+      - "8001:8001"
+    networks:
+      - detection-network
+
+  presidio:
+    build:
+      context: ./presidio-service
+    container_name: presidio
+    ports:
+      - "8002:8002"
+    networks:
+      - detection-network
+
+networks:
+  detection-network:
+    driver: bridge

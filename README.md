@@ -1,2 +1,5 @@
 # apigateway
-go gatewayv2 
+
+Unified detection engine implementation is available under:
+
+- `intertrace-detection-engine/README.md`
