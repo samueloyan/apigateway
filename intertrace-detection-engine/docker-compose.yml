@@ -10,6 +10,8 @@ services:
       FAIL_CLOSED: ${FAIL_CLOSED:-true}
       ENABLE_NEMO: ${ENABLE_NEMO:-true}
       ENABLE_PRESIDIO: ${ENABLE_PRESIDIO:-true}
+      DEBUG_DETECTION: ${DEBUG_DETECTION:-false}
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
       PORT: 8080
     depends_on:
       - nemo-guardrails
@@ -23,6 +25,8 @@ services:
     build:
       context: ./nemo-guardrails-service
     container_name: nemo-guardrails
+    environment:
+      PORT: 8001
     ports:
       - "8001:8001"
     networks:
@@ -32,6 +36,9 @@ services:
     build:
       context: ./presidio-service
     container_name: presidio
+    environment:
+      PORT: 8002
+      BLOCK_HIGH_SENSITIVE_DATA: ${BLOCK_HIGH_SENSITIVE_DATA:-false}
     ports:
       - "8002:8002"
     networks:

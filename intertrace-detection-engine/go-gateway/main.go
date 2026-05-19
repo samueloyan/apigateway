@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -25,8 +24,11 @@ const (
 	defaultFailClosed   = true
 	defaultEnableNemo   = true
 	defaultEnablePii    = true
+	defaultDebugMode    = false
+	defaultMaxBodyBytes = int64(1 * 1024 * 1024)
 	defaultGatewayPort  = "8080"
 	requestIDHeaderName = "X-Request-ID"
+	failClosedReason    = "All detection engines failed. Request blocked due to fail closed policy."
 )
 
 var riskOrder = map[string]int{
@@ -44,6 +46,8 @@ type GatewayConfig struct {
 	FailClosed       bool
 	EnableNemo       bool
 	EnablePresidio   bool
+	DebugDetection   bool
+	MaxBodyBytes     int64
 }
 
 type DetectRequest struct {
@@ -68,6 +72,7 @@ type ServiceDetection struct {
 	Categories []string `json:"categories"`
 	Reasons    []string `json:"reasons"`
 	LatencyMS  int64    `json:"latency_ms"`
+	Error      string   `json:"error,omitempty"`
 }
 
 type UnifiedLatency struct {
@@ -82,6 +87,7 @@ type UnifiedDetections struct {
 }
 
 type UnifiedResponse struct {
+	RequestID  string            `json:"request_id"`
 	Decision   string            `json:"decision"`
 	Block      bool              `json:"block"`
 	RiskLevel  string            `json:"risk_level"`
@@ -89,7 +95,6 @@ type UnifiedResponse struct {
 	Reasons    []string          `json:"reasons"`
 	Detections UnifiedDetections `json:"detections"`
 	Latency    UnifiedLatency    `json:"latency"`
-	RequestID  string            `json:"request_id"`
 }
 
 type Gateway struct {
@@ -123,9 +128,11 @@ func main() {
 		slog.String("nemo_service_url", cfg.NemoServiceURL),
 		slog.String("presidio_service_url", cfg.PresidioURL),
 		slog.Int("detection_timeout_ms", int(cfg.DetectionTimeout/time.Millisecond)),
+		slog.Int64("max_body_bytes", cfg.MaxBodyBytes),
 		slog.Bool("fail_closed", cfg.FailClosed),
 		slog.Bool("enable_nemo", cfg.EnableNemo),
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
+		slog.Bool("debug_detection", cfg.DebugDetection),
 	)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -153,9 +160,32 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set(requestIDHeaderName, requestID)
 
+	r.Body = http.MaxBytesReader(w, r.Body, g.cfg.MaxBodyBytes)
+
 	var req DetectRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "http: request body too large") {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "request body exceeds size limit"})
+			return
+		}
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON payload"})
+		return
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON payload"})
+		return
+	}
+	if strings.TrimSpace(req.OrgID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "org_id is required"})
+		return
+	}
+	if strings.TrimSpace(req.ProjectID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "project_id is required"})
+		return
+	}
+	if strings.TrimSpace(req.AssetID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "asset_id is required"})
 		return
 	}
 	if strings.TrimSpace(req.Input) == "" {
@@ -172,11 +202,10 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 		slog.String("org_id", req.OrgID),
 		slog.String("project_id", req.ProjectID),
 		slog.String("asset_id", req.AssetID),
-		slog.String("session_id", req.SessionID),
 	)
 
-	nemoResult := defaultServiceDetection("error", "safe", []string{"nemo service not called"})
-	presidioResult := defaultServiceDetection("error", "safe", []string{"presidio service not called"})
+	nemoResult := defaultServiceDetection("error", "safe", nil)
+	presidioResult := defaultServiceDetection("error", "safe", nil)
 
 	var wg sync.WaitGroup
 	results := make(chan detectionResult, 2)
@@ -190,22 +219,28 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d := g.callDetectionService(r.Context(), g.cfg.NemoServiceURL, payload)
+			d := g.callDetectionService(r.Context(), "nemo", g.cfg.NemoServiceURL, payload, requestID)
 			results <- detectionResult{serviceName: "nemo", detection: d}
 		}()
 	} else {
-		nemoResult = defaultServiceDetection("error", "safe", []string{"nemo service is disabled"})
+		nemoResult = defaultServiceDetection("error", "safe", nil)
+		if g.cfg.DebugDetection {
+			nemoResult.Error = "nemo service is disabled"
+		}
 	}
 
 	if g.cfg.EnablePresidio {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			d := g.callDetectionService(r.Context(), g.cfg.PresidioURL, payload)
+			d := g.callDetectionService(r.Context(), "presidio", g.cfg.PresidioURL, payload, requestID)
 			results <- detectionResult{serviceName: "presidio", detection: d}
 		}()
 	} else {
-		presidioResult = defaultServiceDetection("error", "safe", []string{"presidio service is disabled"})
+		presidioResult = defaultServiceDetection("error", "safe", nil)
+		if g.cfg.DebugDetection {
+			presidioResult.Error = "presidio service is disabled"
+		}
 	}
 
 	go func() {
@@ -227,8 +262,10 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 
 	g.logger.Info("detection request completed",
 		slog.String("request_id", requestID),
+		slog.String("org_id", req.OrgID),
+		slog.String("project_id", req.ProjectID),
+		slog.String("asset_id", req.AssetID),
 		slog.String("decision", response.Decision),
-		slog.Bool("block", response.Block),
 		slog.String("risk_level", response.RiskLevel),
 		slog.Int64("total_latency_ms", response.Latency.TotalMS),
 		slog.String("nemo_status", response.Detections.Nemo.Status),
@@ -238,10 +275,10 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (g *Gateway) callDetectionService(parentCtx context.Context, url string, payload ServiceDetectRequest) ServiceDetection {
+func (g *Gateway) callDetectionService(parentCtx context.Context, serviceName, url string, payload ServiceDetectRequest, requestID string) ServiceDetection {
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
-		return defaultServiceDetection("error", "safe", []string{fmt.Sprintf("failed to encode request: %v", err)})
+		return serviceFailure("error", 0, g.cfg.DebugDetection, serviceName, err.Error())
 	}
 
 	callCtx, cancel := context.WithTimeout(parentCtx, g.cfg.DetectionTimeout)
@@ -250,46 +287,37 @@ func (g *Gateway) callDetectionService(parentCtx context.Context, url string, pa
 	requestStart := time.Now()
 	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(reqBody))
 	if err != nil {
-		return defaultServiceDetection("error", "safe", []string{fmt.Sprintf("failed to create request: %v", err)})
+		return serviceFailure("error", 0, g.cfg.DebugDetection, serviceName, err.Error())
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set(requestIDHeaderName, requestID)
 
 	resp, err := g.client.Do(httpReq)
 	latencyMS := time.Since(requestStart).Milliseconds()
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-			detection := defaultServiceDetection("timeout", "safe", []string{fmt.Sprintf("service timeout after %d ms", g.cfg.DetectionTimeout/time.Millisecond)})
-			detection.LatencyMS = latencyMS
-			return detection
+			return serviceFailure("timeout", latencyMS, g.cfg.DebugDetection, serviceName, "upstream timeout")
 		}
-		detection := defaultServiceDetection("error", "safe", []string{fmt.Sprintf("service call failed: %v", err)})
-		detection.LatencyMS = latencyMS
-		return detection
+		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, err.Error())
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		detection := defaultServiceDetection("error", "safe", []string{fmt.Sprintf("failed to read response: %v", err)})
-		detection.LatencyMS = latencyMS
-		return detection
+		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, err.Error())
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		reason := fmt.Sprintf("service returned status %d", resp.StatusCode)
-		if len(respBody) > 0 {
-			reason = fmt.Sprintf("%s: %s", reason, strings.TrimSpace(string(respBody)))
+		internalErr := "unexpected upstream status " + strconv.Itoa(resp.StatusCode)
+		if g.cfg.DebugDetection && len(respBody) > 0 {
+			internalErr = internalErr + ": " + strings.TrimSpace(string(respBody))
 		}
-		detection := defaultServiceDetection("error", "safe", []string{reason})
-		detection.LatencyMS = latencyMS
-		return detection
+		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, internalErr)
 	}
 
 	var detection ServiceDetection
 	if err := json.Unmarshal(respBody, &detection); err != nil {
-		detection = defaultServiceDetection("error", "safe", []string{fmt.Sprintf("invalid detection response: %v", err)})
-		detection.LatencyMS = latencyMS
-		return detection
+		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, "invalid service response")
 	}
 
 	if detection.Status == "" {
@@ -305,6 +333,7 @@ func (g *Gateway) callDetectionService(parentCtx context.Context, url string, pa
 	if detection.Reasons == nil {
 		detection.Reasons = []string{}
 	}
+	detection.Error = ""
 	if detection.LatencyMS == 0 {
 		detection.LatencyMS = latencyMS
 	}
@@ -315,31 +344,43 @@ func (g *Gateway) callDetectionService(parentCtx context.Context, url string, pa
 func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection, presidio ServiceDetection, totalMS int64) UnifiedResponse {
 	enabledServices := 0
 	failedServices := 0
-	if cfg.EnableNemo {
+	successfulDetections := make([]ServiceDetection, 0, 2)
+
+	if cfg.EnableNemo && nemo.Status != "" {
 		enabledServices++
 		if nemo.Status != "success" {
 			failedServices++
+		} else {
+			successfulDetections = append(successfulDetections, nemo)
 		}
 	}
-	if cfg.EnablePresidio {
+	if cfg.EnablePresidio && presidio.Status != "" {
 		enabledServices++
 		if presidio.Status != "success" {
 			failedServices++
+		} else {
+			successfulDetections = append(successfulDetections, presidio)
 		}
 	}
 
-	risk := normalizeRiskLevel(highestRiskLevel(nemo.RiskLevel, presidio.RiskLevel))
-	block := nemo.Block || presidio.Block
-	reasons := uniqueStrings(append(append([]string{}, nemo.Reasons...), presidio.Reasons...))
-	confidence := maxFloat(nemo.Confidence, presidio.Confidence)
+	risk := "safe"
+	block := false
+	reasons := make([]string, 0, 6)
+	confidence := 0.0
+
+	for _, detection := range successfulDetections {
+		risk = highestRiskLevel(risk, detection.RiskLevel)
+		block = block || detection.Block
+		confidence = maxFloat(confidence, detection.Confidence)
+		reasons = append(reasons, detection.Reasons...)
+	}
+	reasons = uniqueStrings(reasons)
 
 	if enabledServices > 0 && failedServices == enabledServices && cfg.FailClosed {
 		block = true
 		risk = "critical"
-		reasons = uniqueStrings(append(reasons, "all enabled detection services failed or timed out; fail-closed enforced"))
-		if confidence == 0 {
-			confidence = 1.0
-		}
+		reasons = []string{failClosedReason}
+		confidence = 1.0
 	}
 
 	decision := "allow"
@@ -354,6 +395,7 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 	}
 
 	return UnifiedResponse{
+		RequestID:  requestID,
 		Decision:   decision,
 		Block:      block,
 		RiskLevel:  risk,
@@ -368,7 +410,6 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 			NemoMS:     nemo.LatencyMS,
 			PresidioMS: presidio.LatencyMS,
 		},
-		RequestID: requestID,
 	}
 }
 
@@ -379,9 +420,19 @@ func defaultServiceDetection(status, risk string, reasons []string) ServiceDetec
 		RiskLevel:  normalizeRiskLevel(risk),
 		Confidence: 0,
 		Categories: []string{},
-		Reasons:    reasons,
+		Reasons:    uniqueStrings(reasons),
 		LatencyMS:  0,
+		Error:      "",
 	}
+}
+
+func serviceFailure(status string, latencyMS int64, debug bool, serviceName, internalErr string) ServiceDetection {
+	detection := defaultServiceDetection(status, "safe", nil)
+	detection.LatencyMS = latencyMS
+	if debug {
+		detection.Error = serviceName + ": " + strings.TrimSpace(internalErr)
+	}
+	return detection
 }
 
 func normalizeRiskLevel(level string) string {
@@ -435,6 +486,10 @@ func loadConfig() GatewayConfig {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultTimeoutMS
 	}
+	maxBodyBytes := parseEnvInt64("MAX_REQUEST_BODY_BYTES", defaultMaxBodyBytes)
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = defaultMaxBodyBytes
+	}
 
 	return GatewayConfig{
 		NemoServiceURL:   getEnv("NEMO_SERVICE_URL", defaultNemoURL),
@@ -443,6 +498,8 @@ func loadConfig() GatewayConfig {
 		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
 		EnablePresidio:   parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
+		DebugDetection:   parseEnvBool("DEBUG_DETECTION", defaultDebugMode),
+		MaxBodyBytes:     maxBodyBytes,
 	}
 }
 
@@ -460,6 +517,18 @@ func parseEnvInt(key string, defaultValue int) int {
 		return defaultValue
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+func parseEnvInt64(key string, defaultValue int64) int64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return defaultValue
 	}

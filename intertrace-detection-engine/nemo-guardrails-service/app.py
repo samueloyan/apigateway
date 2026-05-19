@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Any
 
@@ -34,29 +35,64 @@ class BaseGuardrailDetector:
 
 
 class StubNemoGuardrailDetector(BaseGuardrailDetector):
-    # Keep phrase mapping explicit so real NeMo guardrails can
-    # replace only this detector implementation later.
-    trigger_map = {
-        "ignore previous instructions": "prompt_injection",
-        "bypass": "policy_violation",
-        "jailbreak": "jailbreak",
-        "developer mode": "jailbreak",
-        "system prompt": "prompt_injection",
-        "reveal your instructions": "prompt_injection",
-        "disable safety": "policy_violation",
-        "act as dan": "jailbreak",
-        "override policy": "policy_violation",
-    }
+    # Keep patterns isolated in this stub detector so a real
+    # NeMo Guardrails adapter can replace this class later.
+    trigger_patterns: list[tuple[str, re.Pattern[str], str]] = [
+        (
+            "prompt_injection",
+            re.compile(r"\bignore\s+(all\s+)?(previous|prior)\s+instructions?\b", re.IGNORECASE),
+            "Prompt attempts to ignore previous instructions.",
+        ),
+        (
+            "policy_violation",
+            re.compile(r"\bbypass\b", re.IGNORECASE),
+            "Prompt attempts to bypass safeguards.",
+        ),
+        (
+            "jailbreak",
+            re.compile(r"\bjailbreak\b", re.IGNORECASE),
+            "Prompt contains jailbreak language.",
+        ),
+        (
+            "jailbreak",
+            re.compile(r"\bdeveloper\s*mode\b", re.IGNORECASE),
+            "Prompt asks for developer mode behavior.",
+        ),
+        (
+            "prompt_injection",
+            re.compile(r"\b(system|hidden)\s+prompt\b", re.IGNORECASE),
+            "Prompt requests protected prompt content.",
+        ),
+        (
+            "prompt_injection",
+            re.compile(r"\breveal\s+(your|the)\s+(instructions|system prompt)\b", re.IGNORECASE),
+            "Prompt requests hidden instructions.",
+        ),
+        (
+            "policy_violation",
+            re.compile(r"\bdisable\s+safety\b", re.IGNORECASE),
+            "Prompt requests safety disablement.",
+        ),
+        (
+            "jailbreak",
+            re.compile(r"\bact\s+as\s+dan\b|\bdo\s+anything\s+now\b", re.IGNORECASE),
+            "Prompt attempts DAN-style jailbreak.",
+        ),
+        (
+            "policy_violation",
+            re.compile(r"\boverride\s+(the\s+)?polic(y|ies)\b", re.IGNORECASE),
+            "Prompt asks to override policy constraints.",
+        ),
+    ]
 
     def detect(self, text: str, context: dict[str, Any]) -> DetectorResult:
-        lowered = text.lower()
         categories: set[str] = set()
         reasons: list[str] = []
 
-        for phrase, category in self.trigger_map.items():
-            if phrase in lowered:
+        for category, pattern, reason in self.trigger_patterns:
+            if pattern.search(text):
                 categories.add(category)
-                reasons.append(f"Detected suspicious guardrail phrase: '{phrase}'")
+                reasons.append(reason)
 
         if categories:
             return DetectorResult(
