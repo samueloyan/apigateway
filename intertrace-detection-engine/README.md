@@ -250,6 +250,18 @@ Recommended service root directories:
 - `intertrace-detection-engine/nemo-guardrails-service`
 - `intertrace-detection-engine/presidio-service`
 
+Suggested Railway CLI sequence (run from repository root):
+
+```bash
+railway login
+railway link --project a87fb19d-9cc0-41f1-989e-eb3adae8e123
+
+# Create/link and deploy each service from its own root directory:
+cd intertrace-detection-engine/go-gateway && railway up --service intertrace-gateway
+cd ../nemo-guardrails-service && railway up --service nemo-guardrails
+cd ../presidio-service && railway up --service presidio-detector
+```
+
 Set gateway env vars:
 
 ```bash
@@ -264,5 +276,6 @@ ENABLE_PRESIDIO=true
 Public domain mapping for gateway:
 
 - `api.intertrace.ai` -> `intertrace-gateway`
+- `PUBLIC_GATEWAY_URL=https://api.intertrace.ai`
 
 Keep Python services private/internal only.
