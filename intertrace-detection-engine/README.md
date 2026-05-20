@@ -200,22 +200,27 @@ OPENAI_API_URL=https://api.openai.com/v1/chat/completions
 ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages
 GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models
 ENABLE_INTERTRACE_TELEMETRY=false
-INTERTRACE_TELEMETRY_URL=https://intertrace.ai/api/v1/telemetry/traces
-INTERTRACE_TELEMETRY_AUTH_TOKEN=
-INTERTRACE_TELEMETRY_FORWARD_AUTH=true
+ENABLE_INTERTRACE_DASHBOARD_INGEST=false
+INTERTRACE_DASHBOARD_URL=https://intertrace.ai
+INTERTRACE_INTERNAL_SECRET=
+INTERTRACE_ORG_KEY_ID=
+INTERTRACE_ORG_SECRET=
+INTERTRACE_ORG_KEY_ID_MAP=
+INTERTRACE_ORG_SECRET_MAP=
+INTERTRACE_INGEST_QUEUE_SIZE=256
+INTERTRACE_INGEST_WORKERS=2
+INTERTRACE_INGEST_RETRIES=3
 INTERTRACE_TELEMETRY_TIMEOUT_MS=1500
 ```
 
 Intertrace dashboard telemetry:
 
-- When `ENABLE_INTERTRACE_TELEMETRY=true` and `INTERTRACE_TELEMETRY_URL` is set, the gateway emits asynchronous telemetry for both `/v1/detect` and `/v1/chat/completions`.
-- If `INTERTRACE_TELEMETRY_URL` is set to a base host (for example `https://intertrace.ai`), the gateway automatically targets `https://intertrace.ai/api/v1/telemetry/traces`.
-- Telemetry does not block request responses; failures are soft.
-- Forwarded request headers are supported for tenant context:
-  - `Authorization`
-  - `X-Intertrace-Org-Id`
-  - `X-Intertrace-Asset`
-- If `INTERTRACE_TELEMETRY_AUTH_TOKEN` is set, it is used as the telemetry bearer token. Otherwise, when `INTERTRACE_TELEMETRY_FORWARD_AUTH=true`, incoming `Authorization` is forwarded.
+- The gateway asynchronously posts one event per completed request to `POST {INTERTRACE_DASHBOARD_URL}/api/gateway/event`.
+- Posting never blocks the user response. Events go through an in-memory queue + worker pool with retries and drop-safe logging when the queue is full.
+- Auth modes:
+  - Shared secret mode: `INTERTRACE_INTERNAL_SECRET`
+  - Org-key mode (preferred): `INTERTRACE_ORG_KEY_ID` + `INTERTRACE_ORG_SECRET` (or per-org maps via `INTERTRACE_ORG_KEY_ID_MAP` and `INTERTRACE_ORG_SECRET_MAP`).
+- Payload includes the required minimum fields (`org_id`, `provider`, `model`, `inbound_verdict`, `outbound_verdict`, `threats`, `pii_detected`, `latency_gateway_ms`) plus recommended context fields (`asset_id`, `request_id`, `gateway_route`, classifier metadata, redacted prompt/response fields, timing breakdowns).
 
 Presidio service:
 

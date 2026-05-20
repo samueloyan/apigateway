@@ -1,34 +1,9 @@
 package main
 
 import (
+	"net/http"
 	"testing"
-	"time"
 )
-
-func TestTelemetryAuthHeaderPrefersStaticToken(t *testing.T) {
-	g := &Gateway{
-		cfg: GatewayConfig{
-			TelemetryAuth: "token-123",
-			ForwardAuth:   true,
-		},
-	}
-	got := g.telemetryAuthHeader("Bearer forwarded")
-	if got != "Bearer token-123" {
-		t.Fatalf("expected static bearer token, got %q", got)
-	}
-}
-
-func TestTelemetryAuthHeaderForwardsWhenEnabled(t *testing.T) {
-	g := &Gateway{
-		cfg: GatewayConfig{
-			ForwardAuth: true,
-		},
-	}
-	got := g.telemetryAuthHeader("Bearer forwarded")
-	if got != "Bearer forwarded" {
-		t.Fatalf("expected forwarded auth header, got %q", got)
-	}
-}
 
 func TestHashTextDeterministic(t *testing.T) {
 	a := hashText("hello")
@@ -41,47 +16,108 @@ func TestHashTextDeterministic(t *testing.T) {
 	}
 }
 
-func TestNormalizeTelemetryURL(t *testing.T) {
-	got := normalizeTelemetryURL("https://intertrace.ai")
-	want := "https://intertrace.ai/api/v1/telemetry/traces"
+func TestNormalizeDashboardURL(t *testing.T) {
+	got := normalizeDashboardURL("https://intertrace.ai/")
+	want := "https://intertrace.ai"
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
 	}
 }
 
-func TestBuildTelemetryTracePayload(t *testing.T) {
-	now := time.Date(2026, 5, 20, 5, 50, 0, 0, time.UTC)
-	payload := buildTelemetryTracePayload(telemetryEnvelope{
-		RequestID: "req-1",
-		Gateway:   "go-gateway",
-		Event: TelemetryEvent{
-			EventType:      "detect",
-			RequestID:      "req-1",
-			AssetID:        "580f7f32-3954-432e-8d14-1a07bf690c79",
-			HTTPStatusCode: 200,
-			LatencyMS:      40,
-			Decision:       "allow",
-			RiskLevel:      "safe",
-			Block:          false,
-			Detections: UnifiedDetections{
-				Nemo: ServiceDetection{Status: "success", RiskLevel: "safe", Confidence: 0.98, LatencyMS: 30},
-				Presidio: ServiceDetection{
-					Status: "success", RiskLevel: "safe", Confidence: 0.98, LatencyMS: 35,
-				},
+func TestEnsureGatewayEventPath(t *testing.T) {
+	got := ensureGatewayEventPath("https://intertrace.ai")
+	want := "https://intertrace.ai/api/gateway/event"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestBuildGatewayEventPayload(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set(intertraceOrgHeader, "header-org")
+	req.Header.Set(intertraceAssetHeader, "header-asset")
+
+	payload := buildGatewayEventPayload(req, TelemetryEvent{
+		RequestID:       "req-1",
+		OrgID:           "",
+		Provider:        "openai",
+		Model:           "gpt-4o-mini",
+		Decision:        "allow",
+		RiskLevel:       "safe",
+		Block:           false,
+		LatencyMS:       42,
+		GatewayRoute:    "/v1/chat/completions",
+		PromptContent:   "user email sam@example.com",
+		ResponseContent: "done",
+		Detections: UnifiedDetections{
+			Nemo:     ServiceDetection{Status: "success"},
+			Presidio: ServiceDetection{Status: "success", Categories: []string{"email_address"}},
+		},
+	})
+
+	if payload.OrgID != "header-org" {
+		t.Fatalf("expected org from header fallback, got %q", payload.OrgID)
+	}
+	if payload.InboundVerdict != "PASS" {
+		t.Fatalf("expected inbound PASS, got %q", payload.InboundVerdict)
+	}
+	if payload.OutboundVerdict != "PASS" {
+		t.Fatalf("expected outbound PASS, got %q", payload.OutboundVerdict)
+	}
+	if payload.LatencyGatewayMS != 42 {
+		t.Fatalf("expected latency 42, got %d", payload.LatencyGatewayMS)
+	}
+	if payload.PromptContent == "user email sam@example.com" {
+		t.Fatalf("expected prompt to be redacted, got %q", payload.PromptContent)
+	}
+	if len(payload.PIIDetected) == 0 {
+		t.Fatal("expected pii_detected to be populated from presidio categories")
+	}
+	if payload.GatewayRoute != "/v1/chat/completions" {
+		t.Fatalf("expected route to be preserved, got %q", payload.GatewayRoute)
+	}
+}
+
+func TestApplyAuthHeadersSharedSecret(t *testing.T) {
+	ingestor := &intertraceEventIngestor{
+		cfg: GatewayConfig{
+			TelemetryAuth: "shared-secret",
+		},
+	}
+	headers := http.Header{}
+	if err := ingestor.applyAuthHeaders(headers, "org-1", []byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("applyAuthHeaders returned error: %v", err)
+	}
+	if headers.Get("X-Intertrace-Internal") == "" || headers.Get("X-Intertrace-Signature") == "" {
+		t.Fatalf("expected shared-secret auth headers to be set, got %+v", headers)
+	}
+}
+
+func TestApplyAuthHeadersOrgKeyPreferred(t *testing.T) {
+	ingestor := &intertraceEventIngestor{
+		cfg: GatewayConfig{
+			TelemetryAuth: "shared-secret",
+			OrgKeyID:      "key-default",
+			OrgSecret:     "org-secret-default",
+			OrgKeyIDMap: map[string]string{
+				"org-2": "key-org-2",
+			},
+			OrgSecretMap: map[string]string{
+				"org-2": "secret-org-2",
 			},
 		},
-	}, now)
-
-	if payload.Trace.Name != "gateway.detect" {
-		t.Fatalf("unexpected trace name: %q", payload.Trace.Name)
 	}
-	if payload.Trace.AssetID != "580f7f32-3954-432e-8d14-1a07bf690c79" {
-		t.Fatalf("unexpected trace asset id: %q", payload.Trace.AssetID)
+	headers := http.Header{}
+	if err := ingestor.applyAuthHeaders(headers, "org-2", []byte(`{"ok":true}`)); err != nil {
+		t.Fatalf("applyAuthHeaders returned error: %v", err)
 	}
-	if len(payload.Spans) != 3 {
-		t.Fatalf("expected 3 spans (gateway + detectors), got %d", len(payload.Spans))
+	if headers.Get("X-Intertrace-Key-Id") != "key-org-2" {
+		t.Fatalf("expected org key id header, got %q", headers.Get("X-Intertrace-Key-Id"))
 	}
-	if payload.Spans[0].Kind != "chain" {
-		t.Fatalf("expected first span kind chain, got %q", payload.Spans[0].Kind)
+	if headers.Get("X-Intertrace-Nonce") == "" || headers.Get("X-Intertrace-Signature") == "" {
+		t.Fatalf("expected org-key signature headers to be set, got %+v", headers)
+	}
+	if headers.Get("X-Intertrace-Internal") != "" {
+		t.Fatalf("expected shared-secret header not set when org-key auth is available")
 	}
 }

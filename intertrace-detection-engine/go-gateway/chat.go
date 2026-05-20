@@ -145,6 +145,7 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least one text message is required"})
 		return
 	}
+	systemPrompt := extractRoleContent(normalizedMessages, "system")
 
 	g.logger.Info("chat completion request started",
 		slog.String("request_id", requestID),
@@ -176,6 +177,9 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 			Block:          detection.Block,
 			Reasons:        detection.Reasons,
 			Detections:     detection.Detections,
+			GatewayRoute:   "/v1/chat/completions",
+			PromptContent:  detectionInput,
+			SystemPrompt:   systemPrompt,
 			RawResponse: chatErrorResponse{
 				RequestID: requestID,
 				Error: chatErrorDetail{
@@ -198,7 +202,9 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	providerStart := time.Now()
 	completion, err := g.requestChatCompletion(r.Context(), provider, req, normalizedMessages, requestID)
+	providerLatencyMS := time.Since(providerStart).Milliseconds()
 	if err != nil {
 		message := "upstream completion request failed"
 		if g.cfg.DebugDetection {
@@ -209,25 +215,29 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 			statusCode = http.StatusGatewayTimeout
 		}
 		g.emitTelemetryAsync(r, TelemetryEvent{
-			EventType:      "chat_completions",
-			RequestID:      requestID,
-			OrgID:          req.OrgID,
-			ProjectID:      req.ProjectID,
-			AssetID:        req.AssetID,
-			SessionID:      req.SessionID,
-			Provider:       provider,
-			Model:          req.Model,
-			HTTPStatusCode: statusCode,
-			LatencyMS:      detection.Latency.TotalMS,
-			InputHash:      hashText(detectionInput),
-			InputChars:     len(detectionInput),
-			MessageCount:   len(normalizedMessages),
-			Decision:       detection.Decision,
-			RiskLevel:      detection.RiskLevel,
-			Block:          detection.Block,
-			Reasons:        detection.Reasons,
-			Detections:     detection.Detections,
-			UpstreamError:  err.Error(),
+			EventType:         "chat_completions",
+			RequestID:         requestID,
+			OrgID:             req.OrgID,
+			ProjectID:         req.ProjectID,
+			AssetID:           req.AssetID,
+			SessionID:         req.SessionID,
+			Provider:          provider,
+			Model:             req.Model,
+			HTTPStatusCode:    statusCode,
+			LatencyMS:         detection.Latency.TotalMS,
+			InputHash:         hashText(detectionInput),
+			InputChars:        len(detectionInput),
+			MessageCount:      len(normalizedMessages),
+			Decision:          detection.Decision,
+			RiskLevel:         detection.RiskLevel,
+			Block:             detection.Block,
+			Reasons:           detection.Reasons,
+			Detections:        detection.Detections,
+			ProviderLatencyMS: providerLatencyMS,
+			GatewayRoute:      "/v1/chat/completions",
+			PromptContent:     detectionInput,
+			SystemPrompt:      systemPrompt,
+			UpstreamError:     err.Error(),
 			RawResponse: chatErrorResponse{
 				RequestID: requestID,
 				Error: chatErrorDetail{
@@ -264,25 +274,30 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		slog.String("risk_level", detection.RiskLevel),
 	)
 	g.emitTelemetryAsync(r, TelemetryEvent{
-		EventType:      "chat_completions",
-		RequestID:      requestID,
-		OrgID:          req.OrgID,
-		ProjectID:      req.ProjectID,
-		AssetID:        req.AssetID,
-		SessionID:      req.SessionID,
-		Provider:       provider,
-		Model:          req.Model,
-		HTTPStatusCode: http.StatusOK,
-		LatencyMS:      detection.Latency.TotalMS,
-		InputHash:      hashText(detectionInput),
-		InputChars:     len(detectionInput),
-		MessageCount:   len(normalizedMessages),
-		Decision:       detection.Decision,
-		RiskLevel:      detection.RiskLevel,
-		Block:          detection.Block,
-		Reasons:        detection.Reasons,
-		Detections:     detection.Detections,
-		RawResponse:    completion,
+		EventType:         "chat_completions",
+		RequestID:         requestID,
+		OrgID:             req.OrgID,
+		ProjectID:         req.ProjectID,
+		AssetID:           req.AssetID,
+		SessionID:         req.SessionID,
+		Provider:          provider,
+		Model:             req.Model,
+		HTTPStatusCode:    http.StatusOK,
+		LatencyMS:         detection.Latency.TotalMS,
+		InputHash:         hashText(detectionInput),
+		InputChars:        len(detectionInput),
+		MessageCount:      len(normalizedMessages),
+		Decision:          detection.Decision,
+		RiskLevel:         detection.RiskLevel,
+		Block:             detection.Block,
+		Reasons:           detection.Reasons,
+		Detections:        detection.Detections,
+		ProviderLatencyMS: providerLatencyMS,
+		GatewayRoute:      "/v1/chat/completions",
+		PromptContent:     detectionInput,
+		SystemPrompt:      systemPrompt,
+		ResponseContent:   firstChatResponseContent(completion),
+		RawResponse:       completion,
 	})
 
 	writeJSON(w, http.StatusOK, completion)
@@ -399,6 +414,27 @@ func buildDetectionInput(messages []normalizedMessage) string {
 		lines = append(lines, message.Role+": "+message.Content)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func extractRoleContent(messages []normalizedMessage, role string) string {
+	target := strings.ToLower(strings.TrimSpace(role))
+	if target == "" {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == target {
+			parts = append(parts, message.Content)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstChatResponseContent(completion ChatCompletionResponse) string {
+	if len(completion.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(completion.Choices[0].Message.Content)
 }
 
 func cloneContext(ctx map[string]interface{}) map[string]interface{} {

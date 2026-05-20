@@ -61,6 +61,13 @@ type GatewayConfig struct {
 	GeminiAPIKey     string
 	TelemetryURL     string
 	TelemetryAuth    string
+	OrgKeyID         string
+	OrgSecret        string
+	OrgSecretMap     map[string]string
+	OrgKeyIDMap      map[string]string
+	IngestQueueSize  int
+	IngestWorkers    int
+	IngestRetries    int
 	FailClosed       bool
 	EnableNemo       bool
 	EnablePresidio   bool
@@ -118,9 +125,10 @@ type UnifiedResponse struct {
 }
 
 type Gateway struct {
-	cfg    GatewayConfig
-	client *http.Client
-	logger *slog.Logger
+	cfg           GatewayConfig
+	client        *http.Client
+	logger        *slog.Logger
+	eventIngestor *intertraceEventIngestor
 }
 
 type detectionResult struct {
@@ -136,6 +144,7 @@ func main() {
 		client: &http.Client{},
 		logger: logger,
 	}
+	gateway.eventIngestor = newIntertraceEventIngestor(cfg, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", gateway.healthHandler)
@@ -157,6 +166,11 @@ func main() {
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
 		slog.Bool("enable_telemetry", cfg.EnableTelemetry),
 		slog.Bool("telemetry_url_configured", cfg.TelemetryURL != ""),
+		slog.Int("ingest_queue_size", cfg.IngestQueueSize),
+		slog.Int("ingest_workers", cfg.IngestWorkers),
+		slog.Int("ingest_retries", cfg.IngestRetries),
+		slog.Bool("org_key_auth_configured", cfg.OrgKeyID != "" && cfg.OrgSecret != ""),
+		slog.Bool("internal_secret_configured", cfg.TelemetryAuth != ""),
 		slog.Bool("debug_detection", cfg.DebugDetection),
 		slog.Bool("openai_configured", cfg.OpenAIAPIKey != ""),
 		slog.Bool("anthropic_configured", cfg.AnthropicAPIKey != ""),
@@ -305,6 +319,8 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 		Block:          response.Block,
 		Reasons:        response.Reasons,
 		Detections:     response.Detections,
+		GatewayRoute:   "/v1/detect",
+		PromptContent:  req.Input,
 		RawResponse:    response,
 	})
 
@@ -546,6 +562,19 @@ func loadConfig() GatewayConfig {
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = defaultMaxBodyBytes
 	}
+	ingestQueueSize := parseEnvInt("INTERTRACE_INGEST_QUEUE_SIZE", 256)
+	if ingestQueueSize <= 0 {
+		ingestQueueSize = 256
+	}
+	ingestWorkers := parseEnvInt("INTERTRACE_INGEST_WORKERS", 2)
+	if ingestWorkers <= 0 {
+		ingestWorkers = 2
+	}
+	ingestRetries := parseEnvInt("INTERTRACE_INGEST_RETRIES", 3)
+	if ingestRetries < 0 {
+		ingestRetries = 3
+	}
+	enableDashboardIngest := parseEnvBool("ENABLE_INTERTRACE_DASHBOARD_INGEST", parseEnvBool("ENABLE_INTERTRACE_TELEMETRY", false))
 
 	return GatewayConfig{
 		NemoServiceURL:   getEnv("NEMO_SERVICE_URL", defaultNemoURL),
@@ -559,16 +588,45 @@ func loadConfig() GatewayConfig {
 		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		AnthropicAPIKey:  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 		GeminiAPIKey:     strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
-		TelemetryURL:     normalizeTelemetryURL(strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_URL"))),
-		TelemetryAuth:    strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN")),
+		TelemetryURL:     normalizeDashboardURL(strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_DASHBOARD_URL"), os.Getenv("INTERTRACE_TELEMETRY_URL")))),
+		TelemetryAuth:    strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_INTERNAL_SECRET"), os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN"))),
+		OrgKeyID:         strings.TrimSpace(os.Getenv("INTERTRACE_ORG_KEY_ID")),
+		OrgSecret:        strings.TrimSpace(os.Getenv("INTERTRACE_ORG_SECRET")),
+		OrgSecretMap:     parseEnvStringMap("INTERTRACE_ORG_SECRET_MAP"),
+		OrgKeyIDMap:      parseEnvStringMap("INTERTRACE_ORG_KEY_ID_MAP"),
+		IngestQueueSize:  ingestQueueSize,
+		IngestWorkers:    ingestWorkers,
+		IngestRetries:    ingestRetries,
 		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
 		EnablePresidio:   parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
-		EnableTelemetry:  parseEnvBool("ENABLE_INTERTRACE_TELEMETRY", false),
+		EnableTelemetry:  enableDashboardIngest,
 		ForwardAuth:      parseEnvBool("INTERTRACE_TELEMETRY_FORWARD_AUTH", true),
 		DebugDetection:   parseEnvBool("DEBUG_DETECTION", defaultDebugMode),
 		MaxBodyBytes:     maxBodyBytes,
 	}
+}
+
+func parseEnvStringMap(key string) map[string]string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return map[string]string{}
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return map[string]string{}
+	}
+	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func contextString(ctx map[string]interface{}, key string) string {
