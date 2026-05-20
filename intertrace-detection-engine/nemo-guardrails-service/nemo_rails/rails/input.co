@@ -1,7 +1,7 @@
 define bot refuse to respond
   "I'm sorry, but I can't assist with that request."
 
-define subflow check prompt policy
+define flow check prompt policy
   $is_blocked = execute is_prompt_policy_blocked
 
   if $is_blocked
