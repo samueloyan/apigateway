@@ -157,6 +157,35 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 
 	detection := g.runDetectionFanout(r.Context(), detectionInput, detectionContext, requestID)
 	if detection.Block {
+		g.emitTelemetryAsync(r, TelemetryEvent{
+			EventType:      "chat_completions",
+			RequestID:      requestID,
+			OrgID:          req.OrgID,
+			ProjectID:      req.ProjectID,
+			AssetID:        req.AssetID,
+			SessionID:      req.SessionID,
+			Provider:       provider,
+			Model:          req.Model,
+			HTTPStatusCode: http.StatusForbidden,
+			LatencyMS:      detection.Latency.TotalMS,
+			InputHash:      hashText(detectionInput),
+			InputChars:     len(detectionInput),
+			MessageCount:   len(normalizedMessages),
+			Decision:       detection.Decision,
+			RiskLevel:      detection.RiskLevel,
+			Block:          detection.Block,
+			Reasons:        detection.Reasons,
+			Detections:     detection.Detections,
+			RawResponse: chatErrorResponse{
+				RequestID: requestID,
+				Error: chatErrorDetail{
+					Message: "Request blocked by detection policy",
+					Type:    "safety_block",
+					Code:    "blocked",
+				},
+				Detection: &detection,
+			},
+		})
 		writeJSON(w, http.StatusForbidden, chatErrorResponse{
 			RequestID: requestID,
 			Error: chatErrorDetail{
@@ -179,6 +208,36 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		if errors.Is(err, context.DeadlineExceeded) {
 			statusCode = http.StatusGatewayTimeout
 		}
+		g.emitTelemetryAsync(r, TelemetryEvent{
+			EventType:      "chat_completions",
+			RequestID:      requestID,
+			OrgID:          req.OrgID,
+			ProjectID:      req.ProjectID,
+			AssetID:        req.AssetID,
+			SessionID:      req.SessionID,
+			Provider:       provider,
+			Model:          req.Model,
+			HTTPStatusCode: statusCode,
+			LatencyMS:      detection.Latency.TotalMS,
+			InputHash:      hashText(detectionInput),
+			InputChars:     len(detectionInput),
+			MessageCount:   len(normalizedMessages),
+			Decision:       detection.Decision,
+			RiskLevel:      detection.RiskLevel,
+			Block:          detection.Block,
+			Reasons:        detection.Reasons,
+			Detections:     detection.Detections,
+			UpstreamError:  err.Error(),
+			RawResponse: chatErrorResponse{
+				RequestID: requestID,
+				Error: chatErrorDetail{
+					Message: message,
+					Type:    "upstream_error",
+					Code:    "upstream_failure",
+				},
+				Detection: &detection,
+			},
+		})
 		writeJSON(w, statusCode, chatErrorResponse{
 			RequestID: requestID,
 			Error: chatErrorDetail{
@@ -204,6 +263,27 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		slog.String("decision", detection.Decision),
 		slog.String("risk_level", detection.RiskLevel),
 	)
+	g.emitTelemetryAsync(r, TelemetryEvent{
+		EventType:      "chat_completions",
+		RequestID:      requestID,
+		OrgID:          req.OrgID,
+		ProjectID:      req.ProjectID,
+		AssetID:        req.AssetID,
+		SessionID:      req.SessionID,
+		Provider:       provider,
+		Model:          req.Model,
+		HTTPStatusCode: http.StatusOK,
+		LatencyMS:      detection.Latency.TotalMS,
+		InputHash:      hashText(detectionInput),
+		InputChars:     len(detectionInput),
+		MessageCount:   len(normalizedMessages),
+		Decision:       detection.Decision,
+		RiskLevel:      detection.RiskLevel,
+		Block:          detection.Block,
+		Reasons:        detection.Reasons,
+		Detections:     detection.Detections,
+		RawResponse:    completion,
+	})
 
 	writeJSON(w, http.StatusOK, completion)
 }

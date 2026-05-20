@@ -23,6 +23,7 @@ const (
 	defaultOpenAIURL       = "https://api.openai.com/v1/chat/completions"
 	defaultAnthropicURL    = "https://api.anthropic.com/v1/messages"
 	defaultGeminiBaseURL   = "https://generativelanguage.googleapis.com/v1beta/models"
+	defaultTelemetryMS     = 1500
 	defaultTimeoutMS       = 2500
 	defaultLLMTimeoutMS    = 45000
 	defaultFailClosed      = true
@@ -51,15 +52,20 @@ type GatewayConfig struct {
 	PresidioURL      string
 	DetectionTimeout time.Duration
 	LLMTimeout       time.Duration
+	TelemetryTimeout time.Duration
 	OpenAIURL        string
 	AnthropicURL     string
 	GeminiBaseURL    string
 	OpenAIAPIKey     string
 	AnthropicAPIKey  string
 	GeminiAPIKey     string
+	TelemetryURL     string
+	TelemetryAuth    string
 	FailClosed       bool
 	EnableNemo       bool
 	EnablePresidio   bool
+	EnableTelemetry  bool
+	ForwardAuth      bool
 	DebugDetection   bool
 	MaxBodyBytes     int64
 }
@@ -144,10 +150,13 @@ func main() {
 		slog.String("presidio_service_url", cfg.PresidioURL),
 		slog.Int("detection_timeout_ms", int(cfg.DetectionTimeout/time.Millisecond)),
 		slog.Int("llm_timeout_ms", int(cfg.LLMTimeout/time.Millisecond)),
+		slog.Int("telemetry_timeout_ms", int(cfg.TelemetryTimeout/time.Millisecond)),
 		slog.Int64("max_body_bytes", cfg.MaxBodyBytes),
 		slog.Bool("fail_closed", cfg.FailClosed),
 		slog.Bool("enable_nemo", cfg.EnableNemo),
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
+		slog.Bool("enable_telemetry", cfg.EnableTelemetry),
+		slog.Bool("telemetry_url_configured", cfg.TelemetryURL != ""),
 		slog.Bool("debug_detection", cfg.DebugDetection),
 		slog.Bool("openai_configured", cfg.OpenAIAPIKey != ""),
 		slog.Bool("anthropic_configured", cfg.AnthropicAPIKey != ""),
@@ -278,6 +287,26 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 
 	totalMS := time.Since(start).Milliseconds()
 	response := aggregateResults(g.cfg, requestID, nemoResult, presidioResult, totalMS)
+	g.emitTelemetryAsync(r, TelemetryEvent{
+		EventType:      "detect",
+		RequestID:      requestID,
+		OrgID:          req.OrgID,
+		ProjectID:      req.ProjectID,
+		AssetID:        req.AssetID,
+		SessionID:      req.SessionID,
+		Provider:       contextString(req.Context, "provider"),
+		Model:          contextString(req.Context, "model"),
+		HTTPStatusCode: http.StatusOK,
+		LatencyMS:      response.Latency.TotalMS,
+		InputHash:      hashText(req.Input),
+		InputChars:     len(req.Input),
+		Decision:       response.Decision,
+		RiskLevel:      response.RiskLevel,
+		Block:          response.Block,
+		Reasons:        response.Reasons,
+		Detections:     response.Detections,
+		RawResponse:    response,
+	})
 
 	g.logger.Info("detection request completed",
 		slog.String("request_id", requestID),
@@ -509,6 +538,10 @@ func loadConfig() GatewayConfig {
 	if llmTimeoutMs <= 0 {
 		llmTimeoutMs = defaultLLMTimeoutMS
 	}
+	telemetryTimeoutMS := parseEnvInt("INTERTRACE_TELEMETRY_TIMEOUT_MS", defaultTelemetryMS)
+	if telemetryTimeoutMS <= 0 {
+		telemetryTimeoutMS = defaultTelemetryMS
+	}
 	maxBodyBytes := parseEnvInt64("MAX_REQUEST_BODY_BYTES", defaultMaxBodyBytes)
 	if maxBodyBytes <= 0 {
 		maxBodyBytes = defaultMaxBodyBytes
@@ -519,18 +552,31 @@ func loadConfig() GatewayConfig {
 		PresidioURL:      getEnv("PRESIDIO_SERVICE_URL", defaultPresidioURL),
 		DetectionTimeout: time.Duration(timeoutMs) * time.Millisecond,
 		LLMTimeout:       time.Duration(llmTimeoutMs) * time.Millisecond,
+		TelemetryTimeout: time.Duration(telemetryTimeoutMS) * time.Millisecond,
 		OpenAIURL:        getEnv("OPENAI_API_URL", defaultOpenAIURL),
 		AnthropicURL:     getEnv("ANTHROPIC_API_URL", defaultAnthropicURL),
 		GeminiBaseURL:    getEnv("GEMINI_API_BASE_URL", defaultGeminiBaseURL),
 		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		AnthropicAPIKey:  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 		GeminiAPIKey:     strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
+		TelemetryURL:     strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_URL")),
+		TelemetryAuth:    strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN")),
 		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
 		EnablePresidio:   parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
+		EnableTelemetry:  parseEnvBool("ENABLE_INTERTRACE_TELEMETRY", false),
+		ForwardAuth:      parseEnvBool("INTERTRACE_TELEMETRY_FORWARD_AUTH", true),
 		DebugDetection:   parseEnvBool("DEBUG_DETECTION", defaultDebugMode),
 		MaxBodyBytes:     maxBodyBytes,
 	}
+}
+
+func contextString(ctx map[string]interface{}, key string) string {
+	value, ok := ctx[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 func getEnv(key, defaultValue string) string {
