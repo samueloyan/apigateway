@@ -520,7 +520,7 @@ func evaluateRuntimePolicy(contextData map[string]interface{}, messages []normal
 			result.Reasons = append(result.Reasons, "Behavioral runtime check flagged credential-seeking intent.")
 			result.GuardTags = append(result.GuardTags, "runtime_policy:credential_intent")
 			result.Categories = append(result.Categories, "credential_abuse")
-			if strings.Contains(messageText, "reveal") || strings.Contains(messageText, "dump") || strings.Contains(messageText, "exfiltrate") {
+			if credentialExfiltrationIntentPattern.MatchString(messageText) {
 				result.Block = true
 			}
 			break

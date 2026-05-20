@@ -37,7 +37,13 @@ class SemanticRiskDetector:
          "Prompt requests protected system instructions."),
         ("adversarial_prompt", re.compile(r"\b(jailbreak|bypass|override|disable)\b.{0,30}\b(guard|policy|safety)\b", re.IGNORECASE),
          "Prompt appears to target safety controls."),
-        ("credential_exfiltration", re.compile(r"\b(api[_-]?key|token|password|secret)\b.{0,25}\b(reveal|dump|extract|print)\b", re.IGNORECASE),
+        ("credential_exfiltration", re.compile(
+            r"\b(reveal|show|dump|extract|print|forward|send|share|provide|give|disclose|expose|leak)\b.{0,40}\b"
+            r"(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b|"
+            r"\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b.{0,40}\b"
+            r"(reveal|show|dump|extract|print|forward|send|share|provide|give|disclose|expose|leak)\b",
+            re.IGNORECASE,
+        ),
          "Prompt appears to request sensitive credential exfiltration."),
     ]
 

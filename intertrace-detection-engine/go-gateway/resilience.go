@@ -16,9 +16,13 @@ var emergencyJailbreakPatterns = []*regexp.Regexp{
 }
 
 var emergencySecretPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)\b(api[_-]?key|access[_-]?token|bearer|password|secret)\b`),
-	regexp.MustCompile(`(?i)\b(aws|gcp|azure)\b.{0,20}\b(key|token|secret)\b`),
+	regexp.MustCompile(`(?i)\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b`),
+	regexp.MustCompile(`(?i)\b(aws|gcp|azure)\b.{0,20}\b(keys?|tokens?|secrets?)\b`),
 }
+
+var credentialExfiltrationIntentPattern = regexp.MustCompile(
+	`(?i)\b(reveal|show|dump|exfiltrate|forward|send|share|provide|give|disclose|leak|expose|print|extract)\b.{0,40}\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b|\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b.{0,40}\b(reveal|show|dump|exfiltrate|forward|send|share|provide|give|disclose|leak|expose|print|extract)\b`,
+)
 
 type emergencyAssessment struct {
 	block      bool
@@ -88,7 +92,7 @@ func emergencyAssessInput(input string) emergencyAssessment {
 			risk = highestRiskLevel(risk, "medium")
 			reasons = append(reasons, "Emergency classifier detected credential or secret access indicators.")
 			categories = append(categories, "credential_request")
-			if strings.Contains(strings.ToLower(text), "show") || strings.Contains(strings.ToLower(text), "reveal") {
+			if credentialExfiltrationIntentPattern.MatchString(text) {
 				block = true
 				risk = highestRiskLevel(risk, "high")
 			}
