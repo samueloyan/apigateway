@@ -559,7 +559,7 @@ func loadConfig() GatewayConfig {
 		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
 		AnthropicAPIKey:  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
 		GeminiAPIKey:     strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
-		TelemetryURL:     strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_URL")),
+		TelemetryURL:     normalizeTelemetryURL(strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_URL"))),
 		TelemetryAuth:    strings.TrimSpace(os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN")),
 		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
