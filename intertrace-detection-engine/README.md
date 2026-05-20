@@ -6,8 +6,9 @@ Low-latency architecture:
 2. Go chat gateway compatibility route (`POST /v1/chat/completions`)
 3. Python NeMo guardrail detector (`POST /detect` on 8001)
 4. Python Presidio-style PII detector (`POST /detect` on 8002)
+5. Python semantic/adversarial detector (`POST /detect` on 8003)
 
-The gateway calls both detectors concurrently and returns one unified detection response.
+The gateway calls all enabled detectors concurrently and returns one unified detection response.
 
 ## Project Structure
 
@@ -22,9 +23,19 @@ intertrace-detection-engine/
     Dockerfile
   nemo-guardrails-service/
     app.py
+    policy_engine.py
+    test_detector.py
+    nemo_rails/
+      config.yml
+      actions.py
+      rails/input.co
     requirements.txt
     Dockerfile
   presidio-service/
+    app.py
+    requirements.txt
+    Dockerfile
+  semantic-detector-service/
     app.py
     requirements.txt
     Dockerfile
@@ -68,12 +79,14 @@ intertrace-detection-engine/
   "reasons": [],
   "detections": {
     "nemo": {},
-    "presidio": {}
+    "presidio": {},
+    "semantic": {}
   },
   "latency": {
     "total_ms": 0,
     "nemo_ms": 0,
-    "presidio_ms": 0
+    "presidio_ms": 0,
+    "semantic_ms": 0
   }
 }
 ```
@@ -123,10 +136,10 @@ Behavior:
 ## Decision and Fail-Closed Logic
 
 - If any successful detector returns `block=true`, final `decision=block`.
-- If no detector blocks and final risk is `medium` or above, final `decision=review`.
+- If no detector blocks and weighted final risk is `medium` or above, final `decision=review`.
 - If all successful detector risks are only `safe`/`low`, final `decision=allow`.
 - Risk precedence: `critical > high > medium > low > safe`.
-- Final confidence = highest confidence among **successful** detectors.
+- Final confidence = weighted confidence among **successful** detectors.
 - Final reasons = deduplicated merge of **successful** detector reasons.
 
 Fail-closed (`FAIL_CLOSED=true`) behavior:
@@ -145,7 +158,7 @@ Fail-closed (`FAIL_CLOSED=true`) behavior:
 - Required request validation for `org_id`, `project_id`, `asset_id`, and non-empty `input`.
 - Structured logs without full prompt text.
 - Request ID support via `X-Request-ID` (generated if missing).
-- Per-service latency (`nemo_ms`, `presidio_ms`) plus total latency.
+- Per-service latency (`nemo_ms`, `presidio_ms`, `semantic_ms`) plus total latency.
 - Health endpoints on all services: `GET /health`.
 - Debug mode:
   - `DEBUG_DETECTION=false`: no internal upstream error details returned.
@@ -153,11 +166,13 @@ Fail-closed (`FAIL_CLOSED=true`) behavior:
 
 ## Detector Behavior
 
-### NeMo stub service
+### NeMo Guardrails service (full integration)
 
-- Case-insensitive phrase and variant matching for prompt injection/jailbreak patterns.
-- Returns high risk and `block=true` when suspicious patterns are detected.
-- Implementation is intentionally isolated in a detector class for future real NeMo integration.
+- Uses the official `nemoguardrails` runtime (`RailsConfig` + `LLMRails`) with a dedicated rails config directory.
+- Runs input rails through `rails.check(...)` on every `/detect` request.
+- Custom rails action (`nemo_rails/actions.py`) evaluates prompt policy via a shared policy engine and blocks disallowed prompts.
+- Policy engine returns structured `risk_level`, `categories`, `reasons`, and confidence for gateway aggregation.
+- Includes tests for safe prompts and high-risk jailbreak, credential-exfiltration, and reverse-shell malware requests.
 
 ### Presidio stub service
 
@@ -178,6 +193,22 @@ Risk policy:
   - `BLOCK_HIGH_SENSITIVE_DATA=false` (default)
   - `BLOCK_HIGH_SENSITIVE_DATA=true` to return `block=true` for high-sensitive findings
 
+### Semantic stub service
+
+Detects:
+
+- Prompt injection/jailbreak semantic intent
+- Guardrail bypass language
+- Credential exfiltration requests
+- Malware/reverse-shell implementation requests
+- Adversarial social-engineering prompt patterns
+
+Risk policy:
+
+- High-risk adversarial semantics => `high`, `block=true`
+- Medium-risk adversarial semantics => `medium`, `block=false`
+- Otherwise => `safe`
+
 ## Environment Variables
 
 Gateway:
@@ -186,11 +217,20 @@ Gateway:
 PORT=8080
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector:8003/detect
 DETECTION_TIMEOUT_MS=2500
+DETECTION_RETRIES=1
+DETECTION_RETRY_BACKOFF_MS=120
+NEMO_WEIGHT=0.35
+PRESIDIO_WEIGHT=0.35
+SEMANTIC_WEIGHT=0.30
 LLM_TIMEOUT_MS=45000
 FAIL_CLOSED=true
+ENABLE_DEGRADED_FALLBACK=true
+DEGRADED_SAFE_DECISION=review
 ENABLE_NEMO=true
 ENABLE_PRESIDIO=true
+ENABLE_SEMANTIC=false
 DEBUG_DETECTION=false
 MAX_REQUEST_BODY_BYTES=1048576
 OPENAI_API_KEY=
@@ -200,21 +240,35 @@ OPENAI_API_URL=https://api.openai.com/v1/chat/completions
 ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages
 GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models
 ENABLE_INTERTRACE_TELEMETRY=false
-INTERTRACE_TELEMETRY_URL=
-INTERTRACE_TELEMETRY_AUTH_TOKEN=
-INTERTRACE_TELEMETRY_FORWARD_AUTH=true
+ENABLE_INTERTRACE_DASHBOARD_INGEST=false
+INTERTRACE_DASHBOARD_URL=https://intertrace.ai
+INTERTRACE_INTERNAL_SECRET=
+INTERTRACE_ORG_KEY_ID=
+INTERTRACE_ORG_SECRET=
+INTERTRACE_ORG_KEY_ID_MAP=
+INTERTRACE_ORG_SECRET_MAP=
+INTERTRACE_INGEST_QUEUE_SIZE=256
+INTERTRACE_INGEST_WORKERS=2
+INTERTRACE_INGEST_RETRIES=3
 INTERTRACE_TELEMETRY_TIMEOUT_MS=1500
 ```
 
 Intertrace dashboard telemetry:
 
-- When `ENABLE_INTERTRACE_TELEMETRY=true` and `INTERTRACE_TELEMETRY_URL` is set, the gateway emits asynchronous telemetry for both `/v1/detect` and `/v1/chat/completions`.
-- Telemetry does not block request responses; failures are soft.
-- Forwarded request headers are supported for tenant context:
-  - `Authorization`
-  - `X-Intertrace-Org-Id`
-  - `X-Intertrace-Asset`
-- If `INTERTRACE_TELEMETRY_AUTH_TOKEN` is set, it is used as the telemetry bearer token. Otherwise, when `INTERTRACE_TELEMETRY_FORWARD_AUTH=true`, incoming `Authorization` is forwarded.
+- The gateway asynchronously posts one event per completed request to `POST {INTERTRACE_DASHBOARD_URL}/api/gateway/event`.
+- Posting never blocks the user response. Events go through an in-memory queue + worker pool with retries and drop-safe logging when the queue is full.
+- Auth modes:
+  - Shared secret mode: `INTERTRACE_INTERNAL_SECRET`
+  - Org-key mode (preferred): `INTERTRACE_ORG_KEY_ID` + `INTERTRACE_ORG_SECRET` (or per-org maps via `INTERTRACE_ORG_KEY_ID_MAP` and `INTERTRACE_ORG_SECRET_MAP`).
+- Payload includes the required minimum fields (`org_id`, `provider`, `model`, `inbound_verdict`, `outbound_verdict`, `threats`, `pii_detected`, `latency_gateway_ms`) plus recommended context fields (`asset_id`, `request_id`, `gateway_route`, classifier metadata, redacted prompt/response fields, timing breakdowns).
+- Detector resiliency:
+  - `DETECTION_RETRIES` + `DETECTION_RETRY_BACKOFF_MS` retry transient detector failures (timeouts, 429, 5xx) before counting a detector as failed.
+  - `ENABLE_DEGRADED_FALLBACK=true` applies an emergency local classifier only when both detectors fail and `FAIL_CLOSED=true`.
+  - In degraded mode, obvious jailbreak/secret-exfiltration indicators remain blocked, while benign prompts downgrade to `DEGRADED_SAFE_DECISION` (`review` by default, or `allow`).
+- Semantic + runtime controls:
+  - Optional semantic detector fanout (`ENABLE_SEMANTIC`, `SEMANTIC_SERVICE_URL`) adds a third model-based signal path for novel/semantic attacks.
+  - Weighted risk fusion across detectors is configurable via `NEMO_WEIGHT`, `PRESIDIO_WEIGHT`, `SEMANTIC_WEIGHT`.
+  - Chat completions enforce runtime policy checks (tool allowlist mismatch, external egress restrictions, credential-seeking behavior, malware/reverse-shell implementation intent) before upstream LLM execution.
 
 Presidio service:
 
@@ -227,6 +281,8 @@ NeMo service:
 
 ```bash
 PORT=8001
+ENABLE_NEMO_GUARDRAILS=true
+NEMO_GUARDRAILS_CONFIG_PATH=nemo_rails
 ```
 
 ## Local Setup
@@ -238,11 +294,19 @@ docker compose build
 docker compose up
 ```
 
+Detector unit checks:
+
+```bash
+cd nemo-guardrails-service && python3 -m unittest test_detector.py
+cd ../go-gateway && go test ./...
+```
+
 Service URLs:
 
 - Gateway: `http://localhost:8080`
 - NeMo detector: `http://localhost:8001`
 - Presidio detector: `http://localhost:8002`
+- Semantic detector: `http://localhost:8003`
 
 ## Health Checks
 
@@ -250,6 +314,7 @@ Service URLs:
 curl -s http://localhost:8080/health | jq
 curl -s http://localhost:8001/health | jq
 curl -s http://localhost:8002/health | jq
+curl -s http://localhost:8003/health | jq
 ```
 
 Expected:
@@ -258,6 +323,7 @@ Expected:
 {"status":"ok","service":"go-gateway"}
 {"status":"ok","service":"nemo-guardrails"}
 {"status":"ok","service":"presidio-detector"}
+{"status":"ok","service":"semantic-detector"}
 ```
 
 ## Test Prompts (Gateway)
@@ -377,12 +443,14 @@ Services:
 1. `intertrace-gateway` (public)
 2. `nemo-guardrails` (private/internal)
 3. `presidio-detector` (private/internal)
+4. `semantic-detector` (private/internal)
 
 Use private networking URLs in gateway config on Railway:
 
 ```bash
 NEMO_SERVICE_URL=http://nemo-guardrails.railway.internal:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio-detector.railway.internal:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector.railway.internal:8003/detect
 ```
 
 For local Docker Compose, use:
@@ -390,6 +458,7 @@ For local Docker Compose, use:
 ```bash
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector:8003/detect
 ```
 
 Public gateway URL:

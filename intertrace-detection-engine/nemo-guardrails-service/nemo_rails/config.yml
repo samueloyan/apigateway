@@ -1,0 +1,7 @@
+models: []
+passthrough: true
+
+rails:
+  input:
+    flows:
+      - check prompt policy

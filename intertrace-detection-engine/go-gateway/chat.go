@@ -145,6 +145,7 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least one text message is required"})
 		return
 	}
+	systemPrompt := extractRoleContent(normalizedMessages, "system")
 
 	g.logger.Info("chat completion request started",
 		slog.String("request_id", requestID),
@@ -156,6 +157,9 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 	)
 
 	detection := g.runDetectionFanout(r.Context(), detectionInput, detectionContext, requestID)
+	detection = g.applyDegradedFallback(detectionInput, detection)
+	runtimePolicy := evaluateRuntimePolicy(req.Context, normalizedMessages)
+	detection = applyRuntimePolicyToUnified(detection, runtimePolicy)
 	if detection.Block {
 		g.emitTelemetryAsync(r, TelemetryEvent{
 			EventType:      "chat_completions",
@@ -176,6 +180,10 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 			Block:          detection.Block,
 			Reasons:        detection.Reasons,
 			Detections:     detection.Detections,
+			GuardTags:      runtimePolicy.GuardTags,
+			GatewayRoute:   "/v1/chat/completions",
+			PromptContent:  detectionInput,
+			SystemPrompt:   systemPrompt,
 			RawResponse: chatErrorResponse{
 				RequestID: requestID,
 				Error: chatErrorDetail{
@@ -198,7 +206,9 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	providerStart := time.Now()
 	completion, err := g.requestChatCompletion(r.Context(), provider, req, normalizedMessages, requestID)
+	providerLatencyMS := time.Since(providerStart).Milliseconds()
 	if err != nil {
 		message := "upstream completion request failed"
 		if g.cfg.DebugDetection {
@@ -209,25 +219,30 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 			statusCode = http.StatusGatewayTimeout
 		}
 		g.emitTelemetryAsync(r, TelemetryEvent{
-			EventType:      "chat_completions",
-			RequestID:      requestID,
-			OrgID:          req.OrgID,
-			ProjectID:      req.ProjectID,
-			AssetID:        req.AssetID,
-			SessionID:      req.SessionID,
-			Provider:       provider,
-			Model:          req.Model,
-			HTTPStatusCode: statusCode,
-			LatencyMS:      detection.Latency.TotalMS,
-			InputHash:      hashText(detectionInput),
-			InputChars:     len(detectionInput),
-			MessageCount:   len(normalizedMessages),
-			Decision:       detection.Decision,
-			RiskLevel:      detection.RiskLevel,
-			Block:          detection.Block,
-			Reasons:        detection.Reasons,
-			Detections:     detection.Detections,
-			UpstreamError:  err.Error(),
+			EventType:         "chat_completions",
+			RequestID:         requestID,
+			OrgID:             req.OrgID,
+			ProjectID:         req.ProjectID,
+			AssetID:           req.AssetID,
+			SessionID:         req.SessionID,
+			Provider:          provider,
+			Model:             req.Model,
+			HTTPStatusCode:    statusCode,
+			LatencyMS:         detection.Latency.TotalMS,
+			InputHash:         hashText(detectionInput),
+			InputChars:        len(detectionInput),
+			MessageCount:      len(normalizedMessages),
+			Decision:          detection.Decision,
+			RiskLevel:         detection.RiskLevel,
+			Block:             detection.Block,
+			Reasons:           detection.Reasons,
+			Detections:        detection.Detections,
+			GuardTags:         runtimePolicy.GuardTags,
+			ProviderLatencyMS: providerLatencyMS,
+			GatewayRoute:      "/v1/chat/completions",
+			PromptContent:     detectionInput,
+			SystemPrompt:      systemPrompt,
+			UpstreamError:     err.Error(),
 			RawResponse: chatErrorResponse{
 				RequestID: requestID,
 				Error: chatErrorDetail{
@@ -264,25 +279,31 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 		slog.String("risk_level", detection.RiskLevel),
 	)
 	g.emitTelemetryAsync(r, TelemetryEvent{
-		EventType:      "chat_completions",
-		RequestID:      requestID,
-		OrgID:          req.OrgID,
-		ProjectID:      req.ProjectID,
-		AssetID:        req.AssetID,
-		SessionID:      req.SessionID,
-		Provider:       provider,
-		Model:          req.Model,
-		HTTPStatusCode: http.StatusOK,
-		LatencyMS:      detection.Latency.TotalMS,
-		InputHash:      hashText(detectionInput),
-		InputChars:     len(detectionInput),
-		MessageCount:   len(normalizedMessages),
-		Decision:       detection.Decision,
-		RiskLevel:      detection.RiskLevel,
-		Block:          detection.Block,
-		Reasons:        detection.Reasons,
-		Detections:     detection.Detections,
-		RawResponse:    completion,
+		EventType:         "chat_completions",
+		RequestID:         requestID,
+		OrgID:             req.OrgID,
+		ProjectID:         req.ProjectID,
+		AssetID:           req.AssetID,
+		SessionID:         req.SessionID,
+		Provider:          provider,
+		Model:             req.Model,
+		HTTPStatusCode:    http.StatusOK,
+		LatencyMS:         detection.Latency.TotalMS,
+		InputHash:         hashText(detectionInput),
+		InputChars:        len(detectionInput),
+		MessageCount:      len(normalizedMessages),
+		Decision:          detection.Decision,
+		RiskLevel:         detection.RiskLevel,
+		Block:             detection.Block,
+		Reasons:           detection.Reasons,
+		Detections:        detection.Detections,
+		GuardTags:         runtimePolicy.GuardTags,
+		ProviderLatencyMS: providerLatencyMS,
+		GatewayRoute:      "/v1/chat/completions",
+		PromptContent:     detectionInput,
+		SystemPrompt:      systemPrompt,
+		ResponseContent:   firstChatResponseContent(completion),
+		RawResponse:       completion,
 	})
 
 	writeJSON(w, http.StatusOK, completion)
@@ -297,9 +318,10 @@ func (g *Gateway) runDetectionFanout(ctx context.Context, input string, contextD
 
 	nemoResult := defaultServiceDetection("error", "safe", nil)
 	presidioResult := defaultServiceDetection("error", "safe", nil)
+	semanticResult := defaultServiceDetection("error", "safe", nil)
 
 	var wg sync.WaitGroup
-	results := make(chan detectionResult, 2)
+	results := make(chan detectionResult, 3)
 
 	if g.cfg.EnableNemo {
 		wg.Add(1)
@@ -317,6 +339,14 @@ func (g *Gateway) runDetectionFanout(ctx context.Context, input string, contextD
 			results <- detectionResult{serviceName: "presidio", detection: d}
 		}()
 	}
+	if g.cfg.EnableSemantic {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d := g.callDetectionService(ctx, "semantic", g.cfg.SemanticServiceURL, payload, requestID)
+			results <- detectionResult{serviceName: "semantic", detection: d}
+		}()
+	}
 
 	go func() {
 		wg.Wait()
@@ -329,11 +359,13 @@ func (g *Gateway) runDetectionFanout(ctx context.Context, input string, contextD
 			nemoResult = result.detection
 		case "presidio":
 			presidioResult = result.detection
+		case "semantic":
+			semanticResult = result.detection
 		}
 	}
 
 	totalMS := time.Since(start).Milliseconds()
-	return aggregateResults(g.cfg, requestID, nemoResult, presidioResult, totalMS)
+	return aggregateResults(g.cfg, requestID, nemoResult, presidioResult, semanticResult, totalMS)
 }
 
 func normalizeMessages(messages []ChatCompletionMessage) ([]normalizedMessage, error) {
@@ -399,6 +431,221 @@ func buildDetectionInput(messages []normalizedMessage) string {
 		lines = append(lines, message.Role+": "+message.Content)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func extractRoleContent(messages []normalizedMessage, role string) string {
+	target := strings.ToLower(strings.TrimSpace(role))
+	if target == "" {
+		return ""
+	}
+	parts := make([]string, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == target {
+			parts = append(parts, message.Content)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func firstChatResponseContent(completion ChatCompletionResponse) string {
+	if len(completion.Choices) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(completion.Choices[0].Message.Content)
+}
+
+type runtimePolicyResult struct {
+	Block      bool
+	Review     bool
+	Reasons    []string
+	GuardTags  []string
+	Categories []string
+}
+
+func evaluateRuntimePolicy(contextData map[string]interface{}, messages []normalizedMessage) runtimePolicyResult {
+	result := runtimePolicyResult{
+		Reasons:    []string{},
+		GuardTags:  []string{},
+		Categories: []string{},
+	}
+	if contextData == nil {
+		contextData = map[string]interface{}{}
+	}
+
+	allowedTools := toLowerSet(stringSliceFromAny(firstContextValue(contextData, "allowed_tools", "allowedTools")))
+	requestedTools := toLowerSet(stringSliceFromAny(firstContextValue(contextData, "requested_tools", "requestedTools", "tools", "tool", "tool_name", "toolName")))
+	if len(requestedTools) > 0 && len(allowedTools) > 0 {
+		unauthorized := make([]string, 0, len(requestedTools))
+		for tool := range requestedTools {
+			if _, ok := allowedTools[tool]; !ok {
+				unauthorized = append(unauthorized, tool)
+			}
+		}
+		if len(unauthorized) > 0 {
+			result.Block = true
+			result.Reasons = append(result.Reasons, "Runtime policy blocked unauthorized tool request: "+strings.Join(unauthorized, ", "))
+			result.GuardTags = append(result.GuardTags, "runtime_policy:unauthorized_tool")
+			result.Categories = append(result.Categories, "tool_abuse")
+		}
+	}
+
+	allowExternal := true
+	if flag, ok := firstContextValue(contextData, "allow_external_network", "allowExternalNetwork").(bool); ok {
+		allowExternal = flag
+	}
+
+	messageText := strings.ToLower(buildDetectionInput(messages))
+	if !allowExternal && (strings.Contains(messageText, "http://") || strings.Contains(messageText, "https://")) {
+		if strings.Contains(messageText, "send") || strings.Contains(messageText, "post") || strings.Contains(messageText, "upload") || strings.Contains(messageText, "webhook") {
+			result.Block = true
+			result.Reasons = append(result.Reasons, "Runtime policy blocked external data egress request.")
+			result.GuardTags = append(result.GuardTags, "runtime_policy:external_egress_block")
+			result.Categories = append(result.Categories, "data_exfiltration")
+		}
+	}
+
+	for _, pattern := range emergencyJailbreakPatterns {
+		if pattern.MatchString(messageText) {
+			result.Review = true
+			result.Reasons = append(result.Reasons, "Behavioral runtime check flagged jailbreak semantics.")
+			result.GuardTags = append(result.GuardTags, "runtime_policy:jailbreak_semantic")
+			result.Categories = append(result.Categories, "semantic_jailbreak")
+			break
+		}
+	}
+
+	for _, pattern := range emergencySecretPatterns {
+		if pattern.MatchString(messageText) {
+			result.Review = true
+			result.Reasons = append(result.Reasons, "Behavioral runtime check flagged credential-seeking intent.")
+			result.GuardTags = append(result.GuardTags, "runtime_policy:credential_intent")
+			result.Categories = append(result.Categories, "credential_abuse")
+			if credentialExfiltrationIntentPattern.MatchString(messageText) {
+				result.Block = true
+			}
+			break
+		}
+	}
+
+	for _, pattern := range emergencyMalwarePatterns {
+		if pattern.MatchString(messageText) {
+			result.Review = true
+			result.Reasons = append(result.Reasons, "Behavioral runtime check flagged malware implementation intent.")
+			result.GuardTags = append(result.GuardTags, "runtime_policy:malware_intent")
+			result.Categories = append(result.Categories, "malware_abuse")
+			if malwareImplementationIntentPattern.MatchString(messageText) {
+				result.Block = true
+			}
+			break
+		}
+	}
+
+	result.Reasons = uniqueStrings(result.Reasons)
+	result.GuardTags = uniqueStrings(result.GuardTags)
+	result.Categories = uniqueStrings(result.Categories)
+	if result.Block {
+		result.Review = true
+	}
+	return result
+}
+
+func applyRuntimePolicyToUnified(response UnifiedResponse, runtime runtimePolicyResult) UnifiedResponse {
+	if !runtime.Block && !runtime.Review {
+		return response
+	}
+	response.Reasons = uniqueStrings(append(response.Reasons, runtime.Reasons...))
+
+	if response.Detections.Semantic.Status != "success" {
+		response.Detections.Semantic = ServiceDetection{
+			Status:     "success",
+			Block:      false,
+			RiskLevel:  "low",
+			Confidence: 0.75,
+			Categories: []string{},
+			Reasons:    []string{},
+			LatencyMS:  0,
+		}
+	}
+	response.Detections.Semantic.Categories = uniqueStrings(append(response.Detections.Semantic.Categories, runtime.Categories...))
+	response.Detections.Semantic.Reasons = uniqueStrings(append(response.Detections.Semantic.Reasons, runtime.Reasons...))
+
+	if runtime.Block {
+		response.Block = true
+		response.Decision = "block"
+		response.RiskLevel = highestRiskLevel(response.RiskLevel, "high")
+		response.Confidence = maxFloat(response.Confidence, 0.90)
+		response.Detections.Semantic.Block = true
+		response.Detections.Semantic.RiskLevel = highestRiskLevel(response.Detections.Semantic.RiskLevel, "high")
+		return response
+	}
+
+	if runtime.Review && response.Decision == "allow" {
+		response.Decision = "review"
+		response.RiskLevel = highestRiskLevel(response.RiskLevel, "medium")
+		response.Confidence = maxFloat(response.Confidence, 0.70)
+		response.Detections.Semantic.RiskLevel = highestRiskLevel(response.Detections.Semantic.RiskLevel, "medium")
+	}
+	return response
+}
+
+func firstContextValue(contextData map[string]interface{}, keys ...string) interface{} {
+	for _, key := range keys {
+		if value, ok := contextData[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+func stringSliceFromAny(value interface{}) []string {
+	switch typed := value.(type) {
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			trimmed := strings.TrimSpace(item)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []interface{}:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			str, ok := item.(string)
+			if !ok {
+				continue
+			}
+			trimmed := strings.TrimSpace(str)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case string:
+		parts := strings.Split(typed, ",")
+		out := make([]string, 0, len(parts))
+		for _, part := range parts {
+			trimmed := strings.TrimSpace(part)
+			if trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	default:
+		return []string{}
+	}
+}
+
+func toLowerSet(items []string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, item := range items {
+		normalized := strings.ToLower(strings.TrimSpace(item))
+		if normalized == "" {
+			continue
+		}
+		out[normalized] = struct{}{}
+	}
+	return out
 }
 
 func cloneContext(ctx map[string]interface{}) map[string]interface{} {

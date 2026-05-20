@@ -5,11 +5,20 @@ services:
     container_name: go-gateway
     environment:
       DETECTION_TIMEOUT_MS: ${DETECTION_TIMEOUT_MS:-2500}
+      DETECTION_RETRIES: ${DETECTION_RETRIES:-1}
+      DETECTION_RETRY_BACKOFF_MS: ${DETECTION_RETRY_BACKOFF_MS:-120}
+      NEMO_WEIGHT: ${NEMO_WEIGHT:-0.35}
+      PRESIDIO_WEIGHT: ${PRESIDIO_WEIGHT:-0.35}
+      SEMANTIC_WEIGHT: ${SEMANTIC_WEIGHT:-0.30}
       NEMO_SERVICE_URL: ${NEMO_SERVICE_URL:-http://nemo-guardrails:8001/detect}
       PRESIDIO_SERVICE_URL: ${PRESIDIO_SERVICE_URL:-http://presidio:8002/detect}
+      SEMANTIC_SERVICE_URL: ${SEMANTIC_SERVICE_URL:-http://semantic-detector:8003/detect}
       FAIL_CLOSED: ${FAIL_CLOSED:-true}
+      ENABLE_DEGRADED_FALLBACK: ${ENABLE_DEGRADED_FALLBACK:-true}
+      DEGRADED_SAFE_DECISION: ${DEGRADED_SAFE_DECISION:-review}
       ENABLE_NEMO: ${ENABLE_NEMO:-true}
       ENABLE_PRESIDIO: ${ENABLE_PRESIDIO:-true}
+      ENABLE_SEMANTIC: ${ENABLE_SEMANTIC:-false}
       DEBUG_DETECTION: ${DEBUG_DETECTION:-false}
       MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
       LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-45000}
@@ -20,14 +29,22 @@ services:
       ANTHROPIC_API_URL: ${ANTHROPIC_API_URL:-https://api.anthropic.com/v1/messages}
       GEMINI_API_BASE_URL: ${GEMINI_API_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/models}
       ENABLE_INTERTRACE_TELEMETRY: ${ENABLE_INTERTRACE_TELEMETRY:-false}
-      INTERTRACE_TELEMETRY_URL: ${INTERTRACE_TELEMETRY_URL:-}
-      INTERTRACE_TELEMETRY_AUTH_TOKEN: ${INTERTRACE_TELEMETRY_AUTH_TOKEN:-}
-      INTERTRACE_TELEMETRY_FORWARD_AUTH: ${INTERTRACE_TELEMETRY_FORWARD_AUTH:-true}
+      ENABLE_INTERTRACE_DASHBOARD_INGEST: ${ENABLE_INTERTRACE_DASHBOARD_INGEST:-false}
+      INTERTRACE_DASHBOARD_URL: ${INTERTRACE_DASHBOARD_URL:-}
+      INTERTRACE_INTERNAL_SECRET: ${INTERTRACE_INTERNAL_SECRET:-}
+      INTERTRACE_ORG_KEY_ID: ${INTERTRACE_ORG_KEY_ID:-}
+      INTERTRACE_ORG_SECRET: ${INTERTRACE_ORG_SECRET:-}
+      INTERTRACE_ORG_KEY_ID_MAP: ${INTERTRACE_ORG_KEY_ID_MAP:-}
+      INTERTRACE_ORG_SECRET_MAP: ${INTERTRACE_ORG_SECRET_MAP:-}
+      INTERTRACE_INGEST_QUEUE_SIZE: ${INTERTRACE_INGEST_QUEUE_SIZE:-256}
+      INTERTRACE_INGEST_WORKERS: ${INTERTRACE_INGEST_WORKERS:-2}
+      INTERTRACE_INGEST_RETRIES: ${INTERTRACE_INGEST_RETRIES:-3}
       INTERTRACE_TELEMETRY_TIMEOUT_MS: ${INTERTRACE_TELEMETRY_TIMEOUT_MS:-1500}
       PORT: 8080
     depends_on:
       - nemo-guardrails
       - presidio
+      - semantic-detector
     ports:
       - "8080:8080"
     networks:
@@ -39,6 +56,8 @@ services:
     container_name: nemo-guardrails
     environment:
       PORT: 8001
+      ENABLE_NEMO_GUARDRAILS: ${ENABLE_NEMO_GUARDRAILS:-true}
+      NEMO_GUARDRAILS_CONFIG_PATH: ${NEMO_GUARDRAILS_CONFIG_PATH:-nemo_rails}
     ports:
       - "8001:8001"
     networks:
@@ -53,6 +72,17 @@ services:
       BLOCK_HIGH_SENSITIVE_DATA: ${BLOCK_HIGH_SENSITIVE_DATA:-false}
     ports:
       - "8002:8002"
+    networks:
+      - detection-network
+
+  semantic-detector:
+    build:
+      context: ./semantic-detector-service
+    container_name: semantic-detector
+    environment:
+      PORT: 8003
+    ports:
+      - "8003:8003"
     networks:
       - detection-network
 
