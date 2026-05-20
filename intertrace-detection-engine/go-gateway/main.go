@@ -20,6 +20,7 @@ import (
 const (
 	defaultNemoURL          = "http://localhost:8001/detect"
 	defaultPresidioURL      = "http://localhost:8002/detect"
+	defaultSemanticURL      = "http://localhost:8003/detect"
 	defaultOpenAIURL        = "https://api.openai.com/v1/chat/completions"
 	defaultAnthropicURL     = "https://api.anthropic.com/v1/messages"
 	defaultGeminiBaseURL    = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -50,12 +51,24 @@ var riskOrder = map[string]int{
 	"critical": 4,
 }
 
+var riskScore = map[string]float64{
+	"safe":     0.00,
+	"low":      0.25,
+	"medium":   0.50,
+	"high":     0.80,
+	"critical": 1.00,
+}
+
 type GatewayConfig struct {
 	NemoServiceURL         string
 	PresidioURL            string
+	SemanticServiceURL     string
 	DetectionTimeout       time.Duration
 	DetectionRetries       int
 	RetryBackoff           time.Duration
+	NemoWeight             float64
+	PresidioWeight         float64
+	SemanticWeight         float64
 	LLMTimeout             time.Duration
 	TelemetryTimeout       time.Duration
 	OpenAIURL              string
@@ -76,6 +89,7 @@ type GatewayConfig struct {
 	FailClosed             bool
 	EnableNemo             bool
 	EnablePresidio         bool
+	EnableSemantic         bool
 	EnableTelemetry        bool
 	EnableDegradedFallback bool
 	DegradedSafeDecision   string
@@ -113,11 +127,13 @@ type UnifiedLatency struct {
 	TotalMS    int64 `json:"total_ms"`
 	NemoMS     int64 `json:"nemo_ms"`
 	PresidioMS int64 `json:"presidio_ms"`
+	SemanticMS int64 `json:"semantic_ms"`
 }
 
 type UnifiedDetections struct {
 	Nemo     ServiceDetection `json:"nemo"`
 	Presidio ServiceDetection `json:"presidio"`
+	Semantic ServiceDetection `json:"semantic"`
 }
 
 type UnifiedResponse struct {
@@ -164,15 +180,20 @@ func main() {
 		slog.String("address", addr),
 		slog.String("nemo_service_url", cfg.NemoServiceURL),
 		slog.String("presidio_service_url", cfg.PresidioURL),
+		slog.String("semantic_service_url", cfg.SemanticServiceURL),
 		slog.Int("detection_timeout_ms", int(cfg.DetectionTimeout/time.Millisecond)),
 		slog.Int("detection_retries", cfg.DetectionRetries),
 		slog.Int("detection_retry_backoff_ms", int(cfg.RetryBackoff/time.Millisecond)),
+		slog.Float64("nemo_weight", cfg.NemoWeight),
+		slog.Float64("presidio_weight", cfg.PresidioWeight),
+		slog.Float64("semantic_weight", cfg.SemanticWeight),
 		slog.Int("llm_timeout_ms", int(cfg.LLMTimeout/time.Millisecond)),
 		slog.Int("telemetry_timeout_ms", int(cfg.TelemetryTimeout/time.Millisecond)),
 		slog.Int64("max_body_bytes", cfg.MaxBodyBytes),
 		slog.Bool("fail_closed", cfg.FailClosed),
 		slog.Bool("enable_nemo", cfg.EnableNemo),
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
+		slog.Bool("enable_semantic", cfg.EnableSemantic),
 		slog.Bool("enable_degraded_fallback", cfg.EnableDegradedFallback),
 		slog.String("degraded_safe_decision", cfg.DegradedSafeDecision),
 		slog.Bool("enable_telemetry", cfg.EnableTelemetry),
@@ -259,9 +280,10 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 
 	nemoResult := defaultServiceDetection("error", "safe", nil)
 	presidioResult := defaultServiceDetection("error", "safe", nil)
+	semanticResult := defaultServiceDetection("error", "safe", nil)
 
 	var wg sync.WaitGroup
-	results := make(chan detectionResult, 2)
+	results := make(chan detectionResult, 3)
 
 	payload := ServiceDetectRequest{
 		Input:   req.Input,
@@ -296,6 +318,20 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if g.cfg.EnableSemantic {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d := g.callDetectionService(r.Context(), "semantic", g.cfg.SemanticServiceURL, payload, requestID)
+			results <- detectionResult{serviceName: "semantic", detection: d}
+		}()
+	} else {
+		semanticResult = defaultServiceDetection("error", "safe", nil)
+		if g.cfg.DebugDetection {
+			semanticResult.Error = "semantic service is disabled"
+		}
+	}
+
 	go func() {
 		wg.Wait()
 		close(results)
@@ -307,11 +343,13 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 			nemoResult = result.detection
 		case "presidio":
 			presidioResult = result.detection
+		case "semantic":
+			semanticResult = result.detection
 		}
 	}
 
 	totalMS := time.Since(start).Milliseconds()
-	response := aggregateResults(g.cfg, requestID, nemoResult, presidioResult, totalMS)
+	response := aggregateResults(g.cfg, requestID, nemoResult, presidioResult, semanticResult, totalMS)
 	response = g.applyDegradedFallback(req.Input, response)
 	g.emitTelemetryAsync(r, TelemetryEvent{
 		EventType:      "detect",
@@ -346,6 +384,7 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 		slog.Int64("total_latency_ms", response.Latency.TotalMS),
 		slog.String("nemo_status", response.Detections.Nemo.Status),
 		slog.String("presidio_status", response.Detections.Presidio.Status),
+		slog.String("semantic_status", response.Detections.Semantic.Status),
 	)
 
 	writeJSON(w, http.StatusOK, response)
@@ -460,10 +499,13 @@ func (g *Gateway) callDetectionService(parentCtx context.Context, serviceName, u
 	return serviceFailure("error", time.Since(overallStart).Milliseconds(), g.cfg.DebugDetection, serviceName, "upstream request cancelled")
 }
 
-func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection, presidio ServiceDetection, totalMS int64) UnifiedResponse {
+func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection, presidio ServiceDetection, semantic ServiceDetection, totalMS int64) UnifiedResponse {
 	enabledServices := 0
 	failedServices := 0
-	successfulDetections := make([]ServiceDetection, 0, 2)
+	successfulDetections := make([]ServiceDetection, 0, 3)
+	weightedRiskTotal := 0.0
+	weightedConfidenceTotal := 0.0
+	weightApplied := 0.0
 
 	if cfg.EnableNemo && nemo.Status != "" {
 		enabledServices++
@@ -471,6 +513,9 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 			failedServices++
 		} else {
 			successfulDetections = append(successfulDetections, nemo)
+			weightedRiskTotal += cfg.NemoWeight * riskScore[normalizeRiskLevel(nemo.RiskLevel)]
+			weightedConfidenceTotal += cfg.NemoWeight * nemo.Confidence
+			weightApplied += cfg.NemoWeight
 		}
 	}
 	if cfg.EnablePresidio && presidio.Status != "" {
@@ -479,6 +524,20 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 			failedServices++
 		} else {
 			successfulDetections = append(successfulDetections, presidio)
+			weightedRiskTotal += cfg.PresidioWeight * riskScore[normalizeRiskLevel(presidio.RiskLevel)]
+			weightedConfidenceTotal += cfg.PresidioWeight * presidio.Confidence
+			weightApplied += cfg.PresidioWeight
+		}
+	}
+	if cfg.EnableSemantic && semantic.Status != "" {
+		enabledServices++
+		if semantic.Status != "success" {
+			failedServices++
+		} else {
+			successfulDetections = append(successfulDetections, semantic)
+			weightedRiskTotal += cfg.SemanticWeight * riskScore[normalizeRiskLevel(semantic.RiskLevel)]
+			weightedConfidenceTotal += cfg.SemanticWeight * semantic.Confidence
+			weightApplied += cfg.SemanticWeight
 		}
 	}
 
@@ -490,10 +549,19 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 	for _, detection := range successfulDetections {
 		risk = highestRiskLevel(risk, detection.RiskLevel)
 		block = block || detection.Block
-		confidence = maxFloat(confidence, detection.Confidence)
 		reasons = append(reasons, detection.Reasons...)
 	}
 	reasons = uniqueStrings(reasons)
+	weightedRisk := 0.0
+	if weightApplied > 0 {
+		weightedRisk = weightedRiskTotal / weightApplied
+		confidence = weightedConfidenceTotal / weightApplied
+	} else {
+		for _, detection := range successfulDetections {
+			confidence = maxFloat(confidence, detection.Confidence)
+		}
+	}
+	risk = highestRiskLevel(risk, scoreToRiskLevel(weightedRisk))
 
 	if enabledServices > 0 && failedServices == enabledServices && cfg.FailClosed {
 		block = true
@@ -505,7 +573,7 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 	decision := "allow"
 	if block {
 		decision = "block"
-	} else if riskOrder[risk] >= riskOrder["medium"] {
+	} else if riskOrder[risk] >= riskOrder["medium"] || weightedRisk >= 0.45 {
 		decision = "review"
 	}
 
@@ -523,11 +591,13 @@ func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection
 		Detections: UnifiedDetections{
 			Nemo:     nemo,
 			Presidio: presidio,
+			Semantic: semantic,
 		},
 		Latency: UnifiedLatency{
 			TotalMS:    totalMS,
 			NemoMS:     nemo.LatencyMS,
 			PresidioMS: presidio.LatencyMS,
+			SemanticMS: semantic.LatencyMS,
 		},
 	}
 }
@@ -571,6 +641,21 @@ func highestRiskLevel(levels ...string) string {
 		}
 	}
 	return highest
+}
+
+func scoreToRiskLevel(score float64) string {
+	switch {
+	case score >= 0.90:
+		return "critical"
+	case score >= 0.70:
+		return "high"
+	case score >= 0.45:
+		return "medium"
+	case score >= 0.20:
+		return "low"
+	default:
+		return "safe"
+	}
 }
 
 func uniqueStrings(input []string) []string {
@@ -638,6 +723,18 @@ func loadConfig() GatewayConfig {
 	if retryBackoffMS <= 0 {
 		retryBackoffMS = defaultRetryBackoffMS
 	}
+	nemoWeight := parseEnvFloat("NEMO_WEIGHT", 0.35)
+	presidioWeight := parseEnvFloat("PRESIDIO_WEIGHT", 0.35)
+	semanticWeight := parseEnvFloat("SEMANTIC_WEIGHT", 0.30)
+	if nemoWeight < 0 {
+		nemoWeight = 0.35
+	}
+	if presidioWeight < 0 {
+		presidioWeight = 0.35
+	}
+	if semanticWeight < 0 {
+		semanticWeight = 0.30
+	}
 	degradedSafeDecision := strings.ToLower(strings.TrimSpace(getEnv("DEGRADED_SAFE_DECISION", "review")))
 	if degradedSafeDecision != "allow" && degradedSafeDecision != "review" {
 		degradedSafeDecision = "review"
@@ -646,9 +743,13 @@ func loadConfig() GatewayConfig {
 	return GatewayConfig{
 		NemoServiceURL:         getEnv("NEMO_SERVICE_URL", defaultNemoURL),
 		PresidioURL:            getEnv("PRESIDIO_SERVICE_URL", defaultPresidioURL),
+		SemanticServiceURL:     getEnv("SEMANTIC_SERVICE_URL", defaultSemanticURL),
 		DetectionTimeout:       time.Duration(timeoutMs) * time.Millisecond,
 		DetectionRetries:       detectionRetries,
 		RetryBackoff:           time.Duration(retryBackoffMS) * time.Millisecond,
+		NemoWeight:             nemoWeight,
+		PresidioWeight:         presidioWeight,
+		SemanticWeight:         semanticWeight,
 		LLMTimeout:             time.Duration(llmTimeoutMs) * time.Millisecond,
 		TelemetryTimeout:       time.Duration(telemetryTimeoutMS) * time.Millisecond,
 		OpenAIURL:              getEnv("OPENAI_API_URL", defaultOpenAIURL),
@@ -669,6 +770,7 @@ func loadConfig() GatewayConfig {
 		FailClosed:             parseEnvBool("FAIL_CLOSED", defaultFailClosed),
 		EnableNemo:             parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
 		EnablePresidio:         parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
+		EnableSemantic:         parseEnvBool("ENABLE_SEMANTIC", false),
 		EnableTelemetry:        enableDashboardIngest,
 		EnableDegradedFallback: parseEnvBool("ENABLE_DEGRADED_FALLBACK", true),
 		DegradedSafeDecision:   degradedSafeDecision,
@@ -734,6 +836,18 @@ func parseEnvInt64(key string, defaultValue int64) int64 {
 		return defaultValue
 	}
 	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+func parseEnvFloat(key string, defaultValue float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil {
 		return defaultValue
 	}

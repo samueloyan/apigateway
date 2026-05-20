@@ -425,6 +425,7 @@ func deriveThreats(event TelemetryEvent) []Threat {
 		}
 		appendCategoriesAsThreats("nemo", detections.Nemo)
 		appendCategoriesAsThreats("presidio", detections.Presidio)
+		appendCategoriesAsThreats("semantic", detections.Semantic)
 	}
 	return dedupeThreats(threats)
 }
@@ -472,11 +473,14 @@ func derivePII(event TelemetryEvent) []string {
 func deriveClassifierUsed(detections interface{}) string {
 	used := []string{}
 	if d, ok := detections.(UnifiedDetections); ok {
-		if strings.TrimSpace(d.Nemo.Status) != "" {
+		if strings.TrimSpace(d.Nemo.Status) == "success" {
 			used = append(used, "nemo")
 		}
-		if strings.TrimSpace(d.Presidio.Status) != "" {
+		if strings.TrimSpace(d.Presidio.Status) == "success" {
 			used = append(used, "presidio")
+		}
+		if strings.TrimSpace(d.Semantic.Status) == "success" {
+			used = append(used, "semantic")
 		}
 	}
 	if len(used) == 0 {
@@ -497,10 +501,10 @@ func deriveGuardTags(event TelemetryEvent) []string {
 		}
 	}
 	if d, ok := event.Detections.(UnifiedDetections); ok {
-		if d.Nemo.Status == "timeout" || d.Presidio.Status == "timeout" {
+		if d.Nemo.Status == "timeout" || d.Presidio.Status == "timeout" || d.Semantic.Status == "timeout" {
 			tags = append(tags, "guard_timeout:classifier_inbound")
 		}
-		if d.Nemo.Status == "error" || d.Presidio.Status == "error" {
+		if d.Nemo.Status == "error" || d.Presidio.Status == "error" || d.Semantic.Status == "error" {
 			tags = append(tags, "guard_error:classifier_inbound")
 		}
 	}

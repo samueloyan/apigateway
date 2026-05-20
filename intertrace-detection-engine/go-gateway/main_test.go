@@ -3,13 +3,13 @@ package main
 import "testing"
 
 func TestAggregateResultsFailClosed(t *testing.T) {
-	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true}
+	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true, EnableSemantic: false, NemoWeight: 0.5, PresidioWeight: 0.5}
 	nemo := defaultServiceDetection("timeout", "safe", nil)
 	nemo.LatencyMS = 2500
 	presidio := defaultServiceDetection("error", "safe", nil)
 	presidio.LatencyMS = 2500
 
-	resp := aggregateResults(cfg, "req-1", nemo, presidio, 2501)
+	resp := aggregateResults(cfg, "req-1", nemo, presidio, defaultServiceDetection("error", "safe", nil), 2501)
 
 	if resp.Decision != "block" {
 		t.Fatalf("expected block decision, got %s", resp.Decision)
@@ -26,7 +26,7 @@ func TestAggregateResultsFailClosed(t *testing.T) {
 }
 
 func TestAggregateResultsUsesSuccessfulDetectorOnly(t *testing.T) {
-	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true}
+	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true, EnableSemantic: false, NemoWeight: 0.5, PresidioWeight: 0.5}
 	nemo := ServiceDetection{
 		Status:     "success",
 		Block:      false,
@@ -40,7 +40,7 @@ func TestAggregateResultsUsesSuccessfulDetectorOnly(t *testing.T) {
 	presidio.Confidence = 0.99
 	presidio.LatencyMS = 2500
 
-	resp := aggregateResults(cfg, "req-2", nemo, presidio, 2501)
+	resp := aggregateResults(cfg, "req-2", nemo, presidio, defaultServiceDetection("error", "safe", nil), 2501)
 
 	if resp.Decision != "review" {
 		t.Fatalf("expected review decision, got %s", resp.Decision)
@@ -54,7 +54,7 @@ func TestAggregateResultsUsesSuccessfulDetectorOnly(t *testing.T) {
 }
 
 func TestAggregateResultsBlockPrecedence(t *testing.T) {
-	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true}
+	cfg := GatewayConfig{FailClosed: true, EnableNemo: true, EnablePresidio: true, EnableSemantic: false, NemoWeight: 0.5, PresidioWeight: 0.5}
 	nemo := ServiceDetection{
 		Status:     "success",
 		Block:      true,
@@ -74,7 +74,7 @@ func TestAggregateResultsBlockPrecedence(t *testing.T) {
 		LatencyMS:  12,
 	}
 
-	resp := aggregateResults(cfg, "req-3", nemo, presidio, 20)
+	resp := aggregateResults(cfg, "req-3", nemo, presidio, defaultServiceDetection("error", "safe", nil), 20)
 	if resp.Decision != "block" {
 		t.Fatalf("expected block decision, got %s", resp.Decision)
 	}
@@ -83,5 +83,37 @@ func TestAggregateResultsBlockPrecedence(t *testing.T) {
 	}
 	if resp.RiskLevel != "high" {
 		t.Fatalf("expected highest successful risk, got %s", resp.RiskLevel)
+	}
+}
+
+func TestAggregateResultsWeightedSemanticReview(t *testing.T) {
+	cfg := GatewayConfig{
+		FailClosed:     true,
+		EnableNemo:     true,
+		EnablePresidio: true,
+		EnableSemantic: true,
+		NemoWeight:     0.2,
+		PresidioWeight: 0.2,
+		SemanticWeight: 0.6,
+	}
+	nemo := ServiceDetection{Status: "success", RiskLevel: "safe", Confidence: 0.95}
+	presidio := ServiceDetection{Status: "success", RiskLevel: "safe", Confidence: 0.95}
+	semantic := ServiceDetection{
+		Status:     "success",
+		RiskLevel:  "high",
+		Confidence: 0.9,
+		Reasons:    []string{"semantic jailbreak intent"},
+		Categories: []string{"semantic_jailbreak"},
+	}
+
+	resp := aggregateResults(cfg, "req-weighted", nemo, presidio, semantic, 33)
+	if resp.Decision != "review" {
+		t.Fatalf("expected weighted semantic signal to trigger review, got %s", resp.Decision)
+	}
+	if resp.Block {
+		t.Fatal("expected no hard block when only semantic review signal present")
+	}
+	if resp.Detections.Semantic.Status != "success" {
+		t.Fatalf("expected semantic detector to be present in response, got %q", resp.Detections.Semantic.Status)
 	}
 }

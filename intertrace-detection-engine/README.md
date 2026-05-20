@@ -186,15 +186,20 @@ Gateway:
 PORT=8080
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector:8003/detect
 DETECTION_TIMEOUT_MS=2500
 DETECTION_RETRIES=1
 DETECTION_RETRY_BACKOFF_MS=120
+NEMO_WEIGHT=0.35
+PRESIDIO_WEIGHT=0.35
+SEMANTIC_WEIGHT=0.30
 LLM_TIMEOUT_MS=45000
 FAIL_CLOSED=true
 ENABLE_DEGRADED_FALLBACK=true
 DEGRADED_SAFE_DECISION=review
 ENABLE_NEMO=true
 ENABLE_PRESIDIO=true
+ENABLE_SEMANTIC=false
 DEBUG_DETECTION=false
 MAX_REQUEST_BODY_BYTES=1048576
 OPENAI_API_KEY=
@@ -229,6 +234,10 @@ Intertrace dashboard telemetry:
   - `DETECTION_RETRIES` + `DETECTION_RETRY_BACKOFF_MS` retry transient detector failures (timeouts, 429, 5xx) before counting a detector as failed.
   - `ENABLE_DEGRADED_FALLBACK=true` applies an emergency local classifier only when both detectors fail and `FAIL_CLOSED=true`.
   - In degraded mode, obvious jailbreak/secret-exfiltration indicators remain blocked, while benign prompts downgrade to `DEGRADED_SAFE_DECISION` (`review` by default, or `allow`).
+- Semantic + runtime controls:
+  - Optional semantic detector fanout (`ENABLE_SEMANTIC`, `SEMANTIC_SERVICE_URL`) adds a third model-based signal path for novel/semantic attacks.
+  - Weighted risk fusion across detectors is configurable via `NEMO_WEIGHT`, `PRESIDIO_WEIGHT`, `SEMANTIC_WEIGHT`.
+  - Chat completions enforce runtime policy checks (tool allowlist mismatch, external egress restrictions, credential-seeking behavior) before upstream LLM execution.
 
 Presidio service:
 
