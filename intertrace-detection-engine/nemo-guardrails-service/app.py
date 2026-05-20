@@ -34,73 +34,122 @@ class BaseGuardrailDetector:
         raise NotImplementedError
 
 
-class StubNemoGuardrailDetector(BaseGuardrailDetector):
-    # Keep patterns isolated in this stub detector so a real
-    # NeMo Guardrails adapter can replace this class later.
-    trigger_patterns: list[tuple[str, re.Pattern[str], str]] = [
+class NemoPolicyGuardrailDetector(BaseGuardrailDetector):
+    """Configurable policy rails detector for high-risk prompt intent."""
+
+    high_risk_rules: list[tuple[str, re.Pattern[str], str, float]] = [
         (
             "prompt_injection",
             re.compile(r"\bignore\s+(all\s+)?(previous|prior)\s+instructions?\b", re.IGNORECASE),
             "Prompt attempts to ignore previous instructions.",
+            0.95,
         ),
         (
             "policy_violation",
-            re.compile(r"\bbypass\b", re.IGNORECASE),
+            re.compile(r"\b(bypass|disable|override)\b.{0,30}\b(guardrails?|policy|safety)\b", re.IGNORECASE),
             "Prompt attempts to bypass safeguards.",
+            0.94,
         ),
         (
             "jailbreak",
-            re.compile(r"\bjailbreak\b", re.IGNORECASE),
+            re.compile(r"\b(jailbreak|developer\s*mode|dan|do\s+anything\s+now)\b", re.IGNORECASE),
             "Prompt contains jailbreak language.",
-        ),
-        (
-            "jailbreak",
-            re.compile(r"\bdeveloper\s*mode\b", re.IGNORECASE),
-            "Prompt asks for developer mode behavior.",
+            0.93,
         ),
         (
             "prompt_injection",
-            re.compile(r"\b(system|hidden)\s+prompt\b", re.IGNORECASE),
+            re.compile(r"\b(reveal|leak|show)\b.{0,35}\b(system|hidden)\s+prompt\b", re.IGNORECASE),
             "Prompt requests protected prompt content.",
+            0.92,
         ),
         (
-            "prompt_injection",
-            re.compile(r"\breveal\s+(your|the)\s+(instructions|system prompt)\b", re.IGNORECASE),
-            "Prompt requests hidden instructions.",
+            "credential_exfiltration",
+            re.compile(
+                r"\b(reveal|show|dump|extract|print|forward|send|share|provide|give|disclose|leak|expose)\b.{0,45}\b"
+                r"(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b|"
+                r"\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b.{0,45}\b"
+                r"(reveal|show|dump|extract|print|forward|send|share|provide|give|disclose|leak|expose)\b",
+                re.IGNORECASE,
+            ),
+            "Prompt appears to request credential or secret exfiltration.",
+            0.98,
         ),
         (
-            "policy_violation",
-            re.compile(r"\bdisable\s+safety\b", re.IGNORECASE),
-            "Prompt requests safety disablement.",
+            "credential_exfiltration",
+            re.compile(r"\b(i am|i'm)\s+the\s+(admin|owner|root|security\s+lead)\b.{0,50}\b(api(?:[_\s-]?keys?)?|secrets?|credentials?)\b", re.IGNORECASE),
+            "Prompt claims privileged identity to request credentials.",
+            0.92,
         ),
+    ]
+
+    medium_risk_rules: list[tuple[str, re.Pattern[str], str, float]] = [
         (
-            "jailbreak",
-            re.compile(r"\bact\s+as\s+dan\b|\bdo\s+anything\s+now\b", re.IGNORECASE),
-            "Prompt attempts DAN-style jailbreak.",
+            "social_engineering",
+            re.compile(r"\bpretend\s+to\s+be\b|\bimpersonate\b", re.IGNORECASE),
+            "Prompt uses social-engineering impersonation language.",
+            0.72,
         ),
         (
             "policy_violation",
             re.compile(r"\boverride\s+(the\s+)?polic(y|ies)\b", re.IGNORECASE),
-            "Prompt asks to override policy constraints.",
+            "Prompt attempts to override policy constraints.",
+            0.76,
+        ),
+        (
+            "prompt_injection",
+            re.compile(r"\b(system|hidden)\s+prompt\b", re.IGNORECASE),
+            "Prompt references protected prompt content.",
+            0.74,
         ),
     ]
 
     def detect(self, text: str, context: dict[str, Any]) -> DetectorResult:
+        _ = context
+        normalized = text.strip()
+        if not normalized:
+            return DetectorResult(
+                block=False,
+                risk_level="safe",
+                confidence=0.96,
+                categories=[],
+                reasons=[],
+            )
+
         categories: set[str] = set()
         reasons: list[str] = []
+        confidence = 0.0
+        block = False
 
-        for category, pattern, reason in self.trigger_patterns:
-            if pattern.search(text):
+        for category, pattern, reason, score in self.high_risk_rules:
+            if pattern.search(normalized):
                 categories.add(category)
                 reasons.append(reason)
+                confidence = max(confidence, score)
+                block = True
 
-        if categories:
+        if not block:
+            for category, pattern, reason, score in self.medium_risk_rules:
+                if pattern.search(normalized):
+                    categories.add(category)
+                    reasons.append(reason)
+                    confidence = max(confidence, score)
+
+        if block:
             return DetectorResult(
                 block=True,
                 risk_level="high",
-                confidence=0.91,
+                confidence=max(confidence, 0.90),
                 categories=sorted(categories),
-                reasons=reasons or ["The prompt attempts to override system instructions."],
+                reasons=reasons or ["Prompt appears to violate guardrail policies."],
+            )
+
+        if categories:
+            return DetectorResult(
+                block=False,
+                risk_level="medium",
+                confidence=max(confidence, 0.72),
+                categories=sorted(categories),
+                reasons=reasons,
             )
 
         return DetectorResult(
@@ -122,7 +171,7 @@ def parse_delay_ms(context: dict[str, Any]) -> int:
 
 
 app = FastAPI(title="Nemo Guardrails Detection Service", version="0.1.0")
-detector: BaseGuardrailDetector = StubNemoGuardrailDetector()
+detector: BaseGuardrailDetector = NemoPolicyGuardrailDetector()
 
 
 @app.get("/health")
