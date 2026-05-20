@@ -199,7 +199,22 @@ GEMINI_API_KEY=
 OPENAI_API_URL=https://api.openai.com/v1/chat/completions
 ANTHROPIC_API_URL=https://api.anthropic.com/v1/messages
 GEMINI_API_BASE_URL=https://generativelanguage.googleapis.com/v1beta/models
+ENABLE_INTERTRACE_TELEMETRY=false
+INTERTRACE_TELEMETRY_URL=
+INTERTRACE_TELEMETRY_AUTH_TOKEN=
+INTERTRACE_TELEMETRY_FORWARD_AUTH=true
+INTERTRACE_TELEMETRY_TIMEOUT_MS=1500
 ```
+
+Intertrace dashboard telemetry:
+
+- When `ENABLE_INTERTRACE_TELEMETRY=true` and `INTERTRACE_TELEMETRY_URL` is set, the gateway emits asynchronous telemetry for both `/v1/detect` and `/v1/chat/completions`.
+- Telemetry does not block request responses; failures are soft.
+- Forwarded request headers are supported for tenant context:
+  - `Authorization`
+  - `X-Intertrace-Org-Id`
+  - `X-Intertrace-Asset`
+- If `INTERTRACE_TELEMETRY_AUTH_TOKEN` is set, it is used as the telemetry bearer token. Otherwise, when `INTERTRACE_TELEMETRY_FORWARD_AUTH=true`, incoming `Authorization` is forwarded.
 
 Presidio service:
 

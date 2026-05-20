@@ -19,6 +19,11 @@ services:
       OPENAI_API_URL: ${OPENAI_API_URL:-https://api.openai.com/v1/chat/completions}
       ANTHROPIC_API_URL: ${ANTHROPIC_API_URL:-https://api.anthropic.com/v1/messages}
       GEMINI_API_BASE_URL: ${GEMINI_API_BASE_URL:-https://generativelanguage.googleapis.com/v1beta/models}
+      ENABLE_INTERTRACE_TELEMETRY: ${ENABLE_INTERTRACE_TELEMETRY:-false}
+      INTERTRACE_TELEMETRY_URL: ${INTERTRACE_TELEMETRY_URL:-}
+      INTERTRACE_TELEMETRY_AUTH_TOKEN: ${INTERTRACE_TELEMETRY_AUTH_TOKEN:-}
+      INTERTRACE_TELEMETRY_FORWARD_AUTH: ${INTERTRACE_TELEMETRY_FORWARD_AUTH:-true}
+      INTERTRACE_TELEMETRY_TIMEOUT_MS: ${INTERTRACE_TELEMETRY_TIMEOUT_MS:-1500}
       PORT: 8080
     depends_on:
       - nemo-guardrails
