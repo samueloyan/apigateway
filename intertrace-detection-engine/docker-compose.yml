@@ -56,6 +56,8 @@ services:
     container_name: nemo-guardrails
     environment:
       PORT: 8001
+      ENABLE_NEMO_GUARDRAILS: ${ENABLE_NEMO_GUARDRAILS:-true}
+      NEMO_GUARDRAILS_CONFIG_PATH: ${NEMO_GUARDRAILS_CONFIG_PATH:-nemo_rails}
     ports:
       - "8001:8001"
     networks:

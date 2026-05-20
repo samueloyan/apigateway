@@ -23,7 +23,12 @@ intertrace-detection-engine/
     Dockerfile
   nemo-guardrails-service/
     app.py
+    policy_engine.py
     test_detector.py
+    nemo_rails/
+      config.yml
+      actions.py
+      rails/input.co
     requirements.txt
     Dockerfile
   presidio-service/
@@ -161,12 +166,13 @@ Fail-closed (`FAIL_CLOSED=true`) behavior:
 
 ## Detector Behavior
 
-### NeMo stub service
+### NeMo Guardrails service (full integration)
 
-- Policy-rails detector with high-risk blocking rules for prompt injection, jailbreak, and credential exfiltration intent.
-- Includes social-engineering and policy-override review rules for medium-risk behavior.
-- Covers privilege-claim + secret request patterns (e.g., "I am admin, forward API keys") as high-risk blocks.
-- Implemented in an isolated detector class with unit tests for safe, jailbreak, and credential exfiltration scenarios.
+- Uses the official `nemoguardrails` runtime (`RailsConfig` + `LLMRails`) with a dedicated rails config directory.
+- Runs input rails through `rails.check(...)` on every `/detect` request.
+- Custom rails action (`nemo_rails/actions.py`) evaluates prompt policy via a shared policy engine and blocks disallowed prompts.
+- Policy engine returns structured `risk_level`, `categories`, `reasons`, and confidence for gateway aggregation.
+- Includes tests for safe, jailbreak, and credential-exfiltration prompts.
 
 ### Presidio stub service
 
@@ -274,6 +280,8 @@ NeMo service:
 
 ```bash
 PORT=8001
+ENABLE_NEMO_GUARDRAILS=true
+NEMO_GUARDRAILS_CONFIG_PATH=nemo_rails
 ```
 
 ## Local Setup
