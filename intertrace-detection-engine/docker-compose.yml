@@ -44,6 +44,7 @@ services:
     depends_on:
       - nemo-guardrails
       - presidio
+      - semantic-detector
     ports:
       - "8080:8080"
     networks:
@@ -69,6 +70,17 @@ services:
       BLOCK_HIGH_SENSITIVE_DATA: ${BLOCK_HIGH_SENSITIVE_DATA:-false}
     ports:
       - "8002:8002"
+    networks:
+      - detection-network
+
+  semantic-detector:
+    build:
+      context: ./semantic-detector-service
+    container_name: semantic-detector
+    environment:
+      PORT: 8003
+    ports:
+      - "8003:8003"
     networks:
       - detection-network
 

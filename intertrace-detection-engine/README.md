@@ -6,8 +6,9 @@ Low-latency architecture:
 2. Go chat gateway compatibility route (`POST /v1/chat/completions`)
 3. Python NeMo guardrail detector (`POST /detect` on 8001)
 4. Python Presidio-style PII detector (`POST /detect` on 8002)
+5. Python semantic/adversarial detector (`POST /detect` on 8003)
 
-The gateway calls both detectors concurrently and returns one unified detection response.
+The gateway calls all enabled detectors concurrently and returns one unified detection response.
 
 ## Project Structure
 
@@ -25,6 +26,10 @@ intertrace-detection-engine/
     requirements.txt
     Dockerfile
   presidio-service/
+    app.py
+    requirements.txt
+    Dockerfile
+  semantic-detector-service/
     app.py
     requirements.txt
     Dockerfile
@@ -68,12 +73,14 @@ intertrace-detection-engine/
   "reasons": [],
   "detections": {
     "nemo": {},
-    "presidio": {}
+    "presidio": {},
+    "semantic": {}
   },
   "latency": {
     "total_ms": 0,
     "nemo_ms": 0,
-    "presidio_ms": 0
+    "presidio_ms": 0,
+    "semantic_ms": 0
   }
 }
 ```
@@ -123,10 +130,10 @@ Behavior:
 ## Decision and Fail-Closed Logic
 
 - If any successful detector returns `block=true`, final `decision=block`.
-- If no detector blocks and final risk is `medium` or above, final `decision=review`.
+- If no detector blocks and weighted final risk is `medium` or above, final `decision=review`.
 - If all successful detector risks are only `safe`/`low`, final `decision=allow`.
 - Risk precedence: `critical > high > medium > low > safe`.
-- Final confidence = highest confidence among **successful** detectors.
+- Final confidence = weighted confidence among **successful** detectors.
 - Final reasons = deduplicated merge of **successful** detector reasons.
 
 Fail-closed (`FAIL_CLOSED=true`) behavior:
@@ -145,7 +152,7 @@ Fail-closed (`FAIL_CLOSED=true`) behavior:
 - Required request validation for `org_id`, `project_id`, `asset_id`, and non-empty `input`.
 - Structured logs without full prompt text.
 - Request ID support via `X-Request-ID` (generated if missing).
-- Per-service latency (`nemo_ms`, `presidio_ms`) plus total latency.
+- Per-service latency (`nemo_ms`, `presidio_ms`, `semantic_ms`) plus total latency.
 - Health endpoints on all services: `GET /health`.
 - Debug mode:
   - `DEBUG_DETECTION=false`: no internal upstream error details returned.
@@ -177,6 +184,21 @@ Risk policy:
 - High sensitivity blocking is configurable:
   - `BLOCK_HIGH_SENSITIVE_DATA=false` (default)
   - `BLOCK_HIGH_SENSITIVE_DATA=true` to return `block=true` for high-sensitive findings
+
+### Semantic stub service
+
+Detects:
+
+- Prompt injection/jailbreak semantic intent
+- Guardrail bypass language
+- Credential exfiltration requests
+- Adversarial social-engineering prompt patterns
+
+Risk policy:
+
+- High-risk adversarial semantics => `high`, `block=true`
+- Medium-risk adversarial semantics => `medium`, `block=false`
+- Otherwise => `safe`
 
 ## Environment Variables
 
@@ -266,6 +288,7 @@ Service URLs:
 - Gateway: `http://localhost:8080`
 - NeMo detector: `http://localhost:8001`
 - Presidio detector: `http://localhost:8002`
+- Semantic detector: `http://localhost:8003`
 
 ## Health Checks
 
@@ -273,6 +296,7 @@ Service URLs:
 curl -s http://localhost:8080/health | jq
 curl -s http://localhost:8001/health | jq
 curl -s http://localhost:8002/health | jq
+curl -s http://localhost:8003/health | jq
 ```
 
 Expected:
@@ -281,6 +305,7 @@ Expected:
 {"status":"ok","service":"go-gateway"}
 {"status":"ok","service":"nemo-guardrails"}
 {"status":"ok","service":"presidio-detector"}
+{"status":"ok","service":"semantic-detector"}
 ```
 
 ## Test Prompts (Gateway)
@@ -400,12 +425,14 @@ Services:
 1. `intertrace-gateway` (public)
 2. `nemo-guardrails` (private/internal)
 3. `presidio-detector` (private/internal)
+4. `semantic-detector` (private/internal)
 
 Use private networking URLs in gateway config on Railway:
 
 ```bash
 NEMO_SERVICE_URL=http://nemo-guardrails.railway.internal:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio-detector.railway.internal:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector.railway.internal:8003/detect
 ```
 
 For local Docker Compose, use:
@@ -413,6 +440,7 @@ For local Docker Compose, use:
 ```bash
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
+SEMANTIC_SERVICE_URL=http://semantic-detector:8003/detect
 ```
 
 Public gateway URL:
