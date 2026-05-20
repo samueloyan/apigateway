@@ -172,7 +172,7 @@ Fail-closed (`FAIL_CLOSED=true`) behavior:
 - Runs input rails through `rails.check(...)` on every `/detect` request.
 - Custom rails action (`nemo_rails/actions.py`) evaluates prompt policy via a shared policy engine and blocks disallowed prompts.
 - Policy engine returns structured `risk_level`, `categories`, `reasons`, and confidence for gateway aggregation.
-- Includes tests for safe, jailbreak, and credential-exfiltration prompts.
+- Includes tests for safe prompts and high-risk jailbreak, credential-exfiltration, and reverse-shell malware requests.
 
 ### Presidio stub service
 
@@ -200,6 +200,7 @@ Detects:
 - Prompt injection/jailbreak semantic intent
 - Guardrail bypass language
 - Credential exfiltration requests
+- Malware/reverse-shell implementation requests
 - Adversarial social-engineering prompt patterns
 
 Risk policy:
@@ -267,7 +268,7 @@ Intertrace dashboard telemetry:
 - Semantic + runtime controls:
   - Optional semantic detector fanout (`ENABLE_SEMANTIC`, `SEMANTIC_SERVICE_URL`) adds a third model-based signal path for novel/semantic attacks.
   - Weighted risk fusion across detectors is configurable via `NEMO_WEIGHT`, `PRESIDIO_WEIGHT`, `SEMANTIC_WEIGHT`.
-  - Chat completions enforce runtime policy checks (tool allowlist mismatch, external egress restrictions, credential-seeking behavior) before upstream LLM execution.
+  - Chat completions enforce runtime policy checks (tool allowlist mismatch, external egress restrictions, credential-seeking behavior, malware/reverse-shell implementation intent) before upstream LLM execution.
 
 Presidio service:
 

@@ -527,6 +527,19 @@ func evaluateRuntimePolicy(contextData map[string]interface{}, messages []normal
 		}
 	}
 
+	for _, pattern := range emergencyMalwarePatterns {
+		if pattern.MatchString(messageText) {
+			result.Review = true
+			result.Reasons = append(result.Reasons, "Behavioral runtime check flagged malware implementation intent.")
+			result.GuardTags = append(result.GuardTags, "runtime_policy:malware_intent")
+			result.Categories = append(result.Categories, "malware_abuse")
+			if malwareImplementationIntentPattern.MatchString(messageText) {
+				result.Block = true
+			}
+			break
+		}
+	}
+
 	result.Reasons = uniqueStrings(result.Reasons)
 	result.GuardTags = uniqueStrings(result.GuardTags)
 	result.Categories = uniqueStrings(result.Categories)

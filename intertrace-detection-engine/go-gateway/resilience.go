@@ -20,8 +20,17 @@ var emergencySecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\b(aws|gcp|azure)\b.{0,20}\b(keys?|tokens?|secrets?)\b`),
 }
 
+var emergencyMalwarePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(reverse\s+shell|bind\s+shell|backdoor|command\s+and\s+control|c2)\b`),
+	regexp.MustCompile(`(?i)\b(remote\s+code\s+execution|rce|exploit\s+payload)\b`),
+}
+
 var credentialExfiltrationIntentPattern = regexp.MustCompile(
 	`(?i)\b(reveal|show|dump|exfiltrate|forward|send|share|provide|give|disclose|leak|expose|print|extract)\b.{0,40}\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b|\b(api(?:[_\s-]?keys?)?|access(?:[_\s-]?tokens?)?|bearer(?:\s+tokens?)?|passwords?|secrets?|credentials?)\b.{0,40}\b(reveal|show|dump|exfiltrate|forward|send|share|provide|give|disclose|leak|expose|print|extract)\b`,
+)
+
+var malwareImplementationIntentPattern = regexp.MustCompile(
+	`(?i)\b(write|generate|create|build|provide)\b.{0,45}\b(code|script|payload)\b.{0,60}\b(reverse\s+shell|bind\s+shell|backdoor|command\s+and\s+control|c2|rce|remote\s+code\s+execution)\b|\b(reverse\s+shell|bind\s+shell|backdoor)\b.{0,60}\b(execute\s+commands?\s+from\s+the\s+attacker|connect\s+back)\b`,
 )
 
 type emergencyAssessment struct {
@@ -95,6 +104,19 @@ func emergencyAssessInput(input string) emergencyAssessment {
 			if credentialExfiltrationIntentPattern.MatchString(text) {
 				block = true
 				risk = highestRiskLevel(risk, "high")
+			}
+			break
+		}
+	}
+
+	for _, pattern := range emergencyMalwarePatterns {
+		if pattern.MatchString(text) {
+			risk = highestRiskLevel(risk, "high")
+			reasons = append(reasons, "Emergency classifier detected malware or reverse-shell indicators.")
+			categories = append(categories, "malware")
+			if malwareImplementationIntentPattern.MatchString(text) {
+				block = true
+				risk = highestRiskLevel(risk, "critical")
 			}
 			break
 		}

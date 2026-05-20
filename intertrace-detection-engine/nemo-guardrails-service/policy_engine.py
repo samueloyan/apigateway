@@ -71,6 +71,17 @@ HIGH_RISK_RULES: list[tuple[str, re.Pattern[str], str, float]] = [
         "Prompt claims privileged identity to request credentials.",
         0.92,
     ),
+    (
+        "malware",
+        re.compile(
+            r"\b(write|generate|create|build|provide)\b.{0,45}\b(code|script|payload)\b.{0,60}\b"
+            r"(reverse\s+shell|bind\s+shell|backdoor|c2|command\s+and\s+control|rce|remote\s+code\s+execution)\b|"
+            r"\b(reverse\s+shell|bind\s+shell|backdoor)\b.{0,60}\b(execute\s+commands?\s+from\s+the\s+attacker|connect\s+back)\b",
+            re.IGNORECASE,
+        ),
+        "Prompt appears to request malware or reverse-shell implementation guidance.",
+        0.99,
+    ),
 ]
 
 MEDIUM_RISK_RULES: list[tuple[str, re.Pattern[str], str, float]] = [
