@@ -1,0 +1,127 @@
+package main
+
+import (
+	"regexp"
+	"strings"
+)
+
+var emergencyJailbreakPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bignore\s+previous\s+instructions\b`),
+	regexp.MustCompile(`(?i)\breveal\s+(?:your|the)\s+instructions\b`),
+	regexp.MustCompile(`(?i)\bsystem\s+prompt\b`),
+	regexp.MustCompile(`(?i)\b(jailbreak|bypass|override)\b`),
+	regexp.MustCompile(`(?i)\b(?:disable|remove)\s+(?:safety|guardrails?)\b`),
+	regexp.MustCompile(`(?i)\bact\s+as\s+dan\b`),
+	regexp.MustCompile(`(?i)\bdeveloper\s+mode\b`),
+}
+
+var emergencySecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\b(api[_-]?key|access[_-]?token|bearer|password|secret)\b`),
+	regexp.MustCompile(`(?i)\b(aws|gcp|azure)\b.{0,20}\b(key|token|secret)\b`),
+}
+
+type emergencyAssessment struct {
+	block      bool
+	riskLevel  string
+	reasons    []string
+	categories []string
+}
+
+func (g *Gateway) applyDegradedFallback(input string, response UnifiedResponse) UnifiedResponse {
+	if !g.cfg.EnableDegradedFallback || !isFailClosedBlock(response) {
+		return response
+	}
+
+	assessment := emergencyAssessInput(input)
+	reasons := []string{degradedFallbackReason}
+	reasons = append(reasons, assessment.reasons...)
+	response.Reasons = uniqueStrings(reasons)
+
+	if assessment.block {
+		response.Block = true
+		response.Decision = "block"
+		response.RiskLevel = highestRiskLevel(response.RiskLevel, assessment.riskLevel, "high")
+		response.Confidence = maxFloat(response.Confidence, 0.95)
+		return response
+	}
+
+	response.Block = false
+	response.Decision = g.cfg.DegradedSafeDecision
+	if response.Decision == "allow" {
+		response.RiskLevel = highestRiskLevel(response.RiskLevel, "low")
+		response.Confidence = maxFloat(response.Confidence, 0.55)
+		return response
+	}
+	response.RiskLevel = highestRiskLevel(response.RiskLevel, "medium")
+	response.Confidence = maxFloat(response.Confidence, 0.65)
+	return response
+}
+
+func emergencyAssessInput(input string) emergencyAssessment {
+	text := strings.TrimSpace(input)
+	if text == "" {
+		return emergencyAssessment{
+			block:      false,
+			riskLevel:  "medium",
+			reasons:    []string{"Emergency classifier could not assess empty input while detectors were unavailable."},
+			categories: []string{"degraded_unknown"},
+		}
+	}
+
+	reasons := []string{}
+	categories := []string{}
+	block := false
+	risk := "safe"
+
+	for _, pattern := range emergencyJailbreakPatterns {
+		if pattern.MatchString(text) {
+			block = true
+			risk = highestRiskLevel(risk, "high")
+			reasons = append(reasons, "Emergency classifier detected jailbreak or policy bypass indicators.")
+			categories = append(categories, "prompt_injection")
+			break
+		}
+	}
+
+	for _, pattern := range emergencySecretPatterns {
+		if pattern.MatchString(text) {
+			risk = highestRiskLevel(risk, "medium")
+			reasons = append(reasons, "Emergency classifier detected credential or secret access indicators.")
+			categories = append(categories, "credential_request")
+			if strings.Contains(strings.ToLower(text), "show") || strings.Contains(strings.ToLower(text), "reveal") {
+				block = true
+				risk = highestRiskLevel(risk, "high")
+			}
+			break
+		}
+	}
+
+	if emailPattern.MatchString(text) || phonePattern.MatchString(text) || ssnPattern.MatchString(text) || cardPattern.MatchString(text) {
+		risk = highestRiskLevel(risk, "medium")
+		reasons = append(reasons, "Emergency classifier detected potential sensitive data patterns.")
+		categories = append(categories, "pii")
+	}
+
+	if len(reasons) == 0 {
+		reasons = append(reasons, "Emergency classifier found no high-risk indicators while detectors were unavailable.")
+	}
+
+	return emergencyAssessment{
+		block:      block,
+		riskLevel:  risk,
+		reasons:    uniqueStrings(reasons),
+		categories: uniqueStrings(categories),
+	}
+}
+
+func isFailClosedBlock(response UnifiedResponse) bool {
+	if !response.Block || response.Decision != "block" {
+		return false
+	}
+	for _, reason := range response.Reasons {
+		if strings.TrimSpace(reason) == failClosedReason {
+			return true
+		}
+	}
+	return false
+}

@@ -157,6 +157,7 @@ func (g *Gateway) chatCompletionsHandler(w http.ResponseWriter, r *http.Request)
 	)
 
 	detection := g.runDetectionFanout(r.Context(), detectionInput, detectionContext, requestID)
+	detection = g.applyDegradedFallback(detectionInput, detection)
 	if detection.Block {
 		g.emitTelemetryAsync(r, TelemetryEvent{
 			EventType:      "chat_completions",

@@ -18,25 +18,28 @@ import (
 )
 
 const (
-	defaultNemoURL         = "http://localhost:8001/detect"
-	defaultPresidioURL     = "http://localhost:8002/detect"
-	defaultOpenAIURL       = "https://api.openai.com/v1/chat/completions"
-	defaultAnthropicURL    = "https://api.anthropic.com/v1/messages"
-	defaultGeminiBaseURL   = "https://generativelanguage.googleapis.com/v1beta/models"
-	defaultTelemetryMS     = 1500
-	defaultTimeoutMS       = 2500
-	defaultLLMTimeoutMS    = 45000
-	defaultFailClosed      = true
-	defaultEnableNemo      = true
-	defaultEnablePii       = true
-	defaultDebugMode       = false
-	defaultMaxBodyBytes    = int64(1 * 1024 * 1024)
-	defaultGatewayPort     = "8080"
-	requestIDHeaderName    = "X-Request-ID"
-	failClosedReason       = "All detection engines failed. Request blocked due to fail closed policy."
-	defaultProviderOpenAI  = "openai"
-	defaultProviderAnthrop = "anthropic"
-	defaultProviderGemini  = "gemini"
+	defaultNemoURL          = "http://localhost:8001/detect"
+	defaultPresidioURL      = "http://localhost:8002/detect"
+	defaultOpenAIURL        = "https://api.openai.com/v1/chat/completions"
+	defaultAnthropicURL     = "https://api.anthropic.com/v1/messages"
+	defaultGeminiBaseURL    = "https://generativelanguage.googleapis.com/v1beta/models"
+	defaultTelemetryMS      = 1500
+	defaultTimeoutMS        = 2500
+	defaultLLMTimeoutMS     = 45000
+	defaultFailClosed       = true
+	defaultEnableNemo       = true
+	defaultEnablePii        = true
+	defaultDebugMode        = false
+	defaultMaxBodyBytes     = int64(1 * 1024 * 1024)
+	defaultGatewayPort      = "8080"
+	defaultDetectionRetries = 1
+	defaultRetryBackoffMS   = 120
+	requestIDHeaderName     = "X-Request-ID"
+	failClosedReason        = "All detection engines failed. Request blocked due to fail closed policy."
+	degradedFallbackReason  = "Detection services unavailable; emergency classifier fallback applied."
+	defaultProviderOpenAI   = "openai"
+	defaultProviderAnthrop  = "anthropic"
+	defaultProviderGemini   = "gemini"
 )
 
 var riskOrder = map[string]int{
@@ -48,33 +51,37 @@ var riskOrder = map[string]int{
 }
 
 type GatewayConfig struct {
-	NemoServiceURL   string
-	PresidioURL      string
-	DetectionTimeout time.Duration
-	LLMTimeout       time.Duration
-	TelemetryTimeout time.Duration
-	OpenAIURL        string
-	AnthropicURL     string
-	GeminiBaseURL    string
-	OpenAIAPIKey     string
-	AnthropicAPIKey  string
-	GeminiAPIKey     string
-	TelemetryURL     string
-	TelemetryAuth    string
-	OrgKeyID         string
-	OrgSecret        string
-	OrgSecretMap     map[string]string
-	OrgKeyIDMap      map[string]string
-	IngestQueueSize  int
-	IngestWorkers    int
-	IngestRetries    int
-	FailClosed       bool
-	EnableNemo       bool
-	EnablePresidio   bool
-	EnableTelemetry  bool
-	ForwardAuth      bool
-	DebugDetection   bool
-	MaxBodyBytes     int64
+	NemoServiceURL         string
+	PresidioURL            string
+	DetectionTimeout       time.Duration
+	DetectionRetries       int
+	RetryBackoff           time.Duration
+	LLMTimeout             time.Duration
+	TelemetryTimeout       time.Duration
+	OpenAIURL              string
+	AnthropicURL           string
+	GeminiBaseURL          string
+	OpenAIAPIKey           string
+	AnthropicAPIKey        string
+	GeminiAPIKey           string
+	TelemetryURL           string
+	TelemetryAuth          string
+	OrgKeyID               string
+	OrgSecret              string
+	OrgSecretMap           map[string]string
+	OrgKeyIDMap            map[string]string
+	IngestQueueSize        int
+	IngestWorkers          int
+	IngestRetries          int
+	FailClosed             bool
+	EnableNemo             bool
+	EnablePresidio         bool
+	EnableTelemetry        bool
+	EnableDegradedFallback bool
+	DegradedSafeDecision   string
+	ForwardAuth            bool
+	DebugDetection         bool
+	MaxBodyBytes           int64
 }
 
 type DetectRequest struct {
@@ -158,12 +165,16 @@ func main() {
 		slog.String("nemo_service_url", cfg.NemoServiceURL),
 		slog.String("presidio_service_url", cfg.PresidioURL),
 		slog.Int("detection_timeout_ms", int(cfg.DetectionTimeout/time.Millisecond)),
+		slog.Int("detection_retries", cfg.DetectionRetries),
+		slog.Int("detection_retry_backoff_ms", int(cfg.RetryBackoff/time.Millisecond)),
 		slog.Int("llm_timeout_ms", int(cfg.LLMTimeout/time.Millisecond)),
 		slog.Int("telemetry_timeout_ms", int(cfg.TelemetryTimeout/time.Millisecond)),
 		slog.Int64("max_body_bytes", cfg.MaxBodyBytes),
 		slog.Bool("fail_closed", cfg.FailClosed),
 		slog.Bool("enable_nemo", cfg.EnableNemo),
 		slog.Bool("enable_presidio", cfg.EnablePresidio),
+		slog.Bool("enable_degraded_fallback", cfg.EnableDegradedFallback),
+		slog.String("degraded_safe_decision", cfg.DegradedSafeDecision),
 		slog.Bool("enable_telemetry", cfg.EnableTelemetry),
 		slog.Bool("telemetry_url_configured", cfg.TelemetryURL != ""),
 		slog.Int("ingest_queue_size", cfg.IngestQueueSize),
@@ -301,6 +312,7 @@ func (g *Gateway) detectHandler(w http.ResponseWriter, r *http.Request) {
 
 	totalMS := time.Since(start).Milliseconds()
 	response := aggregateResults(g.cfg, requestID, nemoResult, presidioResult, totalMS)
+	response = g.applyDegradedFallback(req.Input, response)
 	g.emitTelemetryAsync(r, TelemetryEvent{
 		EventType:      "detect",
 		RequestID:      requestID,
@@ -344,65 +356,108 @@ func (g *Gateway) callDetectionService(parentCtx context.Context, serviceName, u
 	if err != nil {
 		return serviceFailure("error", 0, g.cfg.DebugDetection, serviceName, err.Error())
 	}
-
-	callCtx, cancel := context.WithTimeout(parentCtx, g.cfg.DetectionTimeout)
-	defer cancel()
-
-	requestStart := time.Now()
-	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(reqBody))
-	if err != nil {
-		return serviceFailure("error", 0, g.cfg.DebugDetection, serviceName, err.Error())
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set(requestIDHeaderName, requestID)
-
-	resp, err := g.client.Do(httpReq)
-	latencyMS := time.Since(requestStart).Milliseconds()
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(callCtx.Err(), context.DeadlineExceeded) {
-			return serviceFailure("timeout", latencyMS, g.cfg.DebugDetection, serviceName, "upstream timeout")
+	overallStart := time.Now()
+	var lastFailure ServiceDetection
+	for attempt := 0; attempt <= g.cfg.DetectionRetries; attempt++ {
+		callCtx, cancel := context.WithTimeout(parentCtx, g.cfg.DetectionTimeout)
+		requestStart := time.Now()
+		httpReq, reqErr := http.NewRequestWithContext(callCtx, http.MethodPost, url, bytes.NewReader(reqBody))
+		if reqErr != nil {
+			cancel()
+			return serviceFailure("error", 0, g.cfg.DebugDetection, serviceName, reqErr.Error())
 		}
-		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, err.Error())
-	}
-	defer resp.Body.Close()
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set(requestIDHeaderName, requestID)
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, err.Error())
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		internalErr := "unexpected upstream status " + strconv.Itoa(resp.StatusCode)
-		if g.cfg.DebugDetection && len(respBody) > 0 {
-			internalErr = internalErr + ": " + strings.TrimSpace(string(respBody))
+		resp, callErr := g.client.Do(httpReq)
+		latencyMS := time.Since(overallStart).Milliseconds()
+		if callErr != nil {
+			cancel()
+			if errors.Is(callErr, context.DeadlineExceeded) || errors.Is(callCtx.Err(), context.DeadlineExceeded) {
+				lastFailure = serviceFailure("timeout", latencyMS, g.cfg.DebugDetection, serviceName, "upstream timeout")
+				if attempt < g.cfg.DetectionRetries {
+					if !sleepWithContext(parentCtx, g.cfg.RetryBackoff) {
+						break
+					}
+					continue
+				}
+				return lastFailure
+			}
+			lastFailure = serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, callErr.Error())
+			if attempt < g.cfg.DetectionRetries {
+				if !sleepWithContext(parentCtx, g.cfg.RetryBackoff) {
+					break
+				}
+				continue
+			}
+			return lastFailure
 		}
-		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, internalErr)
+
+		respBody, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
+		if readErr != nil {
+			lastFailure = serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, readErr.Error())
+			if attempt < g.cfg.DetectionRetries {
+				if !sleepWithContext(parentCtx, g.cfg.RetryBackoff) {
+					break
+				}
+				continue
+			}
+			return lastFailure
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			internalErr := "unexpected upstream status " + strconv.Itoa(resp.StatusCode)
+			if g.cfg.DebugDetection && len(respBody) > 0 {
+				internalErr = internalErr + ": " + strings.TrimSpace(string(respBody))
+			}
+			lastFailure = serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, internalErr)
+			if attempt < g.cfg.DetectionRetries && isRetryableStatus(resp.StatusCode) {
+				if !sleepWithContext(parentCtx, g.cfg.RetryBackoff) {
+					break
+				}
+				continue
+			}
+			return lastFailure
+		}
+
+		var detection ServiceDetection
+		if err := json.Unmarshal(respBody, &detection); err != nil {
+			lastFailure = serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, "invalid service response")
+			if attempt < g.cfg.DetectionRetries {
+				if !sleepWithContext(parentCtx, g.cfg.RetryBackoff) {
+					break
+				}
+				continue
+			}
+			return lastFailure
+		}
+
+		if detection.Status == "" {
+			detection.Status = "success"
+		}
+		if detection.RiskLevel == "" {
+			detection.RiskLevel = "safe"
+		}
+		detection.RiskLevel = normalizeRiskLevel(detection.RiskLevel)
+		if detection.Categories == nil {
+			detection.Categories = []string{}
+		}
+		if detection.Reasons == nil {
+			detection.Reasons = []string{}
+		}
+		detection.Error = ""
+		if detection.LatencyMS == 0 {
+			detection.LatencyMS = time.Since(requestStart).Milliseconds()
+		}
+		return detection
 	}
 
-	var detection ServiceDetection
-	if err := json.Unmarshal(respBody, &detection); err != nil {
-		return serviceFailure("error", latencyMS, g.cfg.DebugDetection, serviceName, "invalid service response")
+	if lastFailure.Status != "" {
+		return lastFailure
 	}
-
-	if detection.Status == "" {
-		detection.Status = "success"
-	}
-	if detection.RiskLevel == "" {
-		detection.RiskLevel = "safe"
-	}
-	detection.RiskLevel = normalizeRiskLevel(detection.RiskLevel)
-	if detection.Categories == nil {
-		detection.Categories = []string{}
-	}
-	if detection.Reasons == nil {
-		detection.Reasons = []string{}
-	}
-	detection.Error = ""
-	if detection.LatencyMS == 0 {
-		detection.LatencyMS = latencyMS
-	}
-
-	return detection
+	return serviceFailure("error", time.Since(overallStart).Milliseconds(), g.cfg.DebugDetection, serviceName, "upstream request cancelled")
 }
 
 func aggregateResults(cfg GatewayConfig, requestID string, nemo ServiceDetection, presidio ServiceDetection, totalMS int64) UnifiedResponse {
@@ -575,35 +630,51 @@ func loadConfig() GatewayConfig {
 		ingestRetries = 3
 	}
 	enableDashboardIngest := parseEnvBool("ENABLE_INTERTRACE_DASHBOARD_INGEST", parseEnvBool("ENABLE_INTERTRACE_TELEMETRY", false))
+	detectionRetries := parseEnvInt("DETECTION_RETRIES", defaultDetectionRetries)
+	if detectionRetries < 0 {
+		detectionRetries = defaultDetectionRetries
+	}
+	retryBackoffMS := parseEnvInt("DETECTION_RETRY_BACKOFF_MS", defaultRetryBackoffMS)
+	if retryBackoffMS <= 0 {
+		retryBackoffMS = defaultRetryBackoffMS
+	}
+	degradedSafeDecision := strings.ToLower(strings.TrimSpace(getEnv("DEGRADED_SAFE_DECISION", "review")))
+	if degradedSafeDecision != "allow" && degradedSafeDecision != "review" {
+		degradedSafeDecision = "review"
+	}
 
 	return GatewayConfig{
-		NemoServiceURL:   getEnv("NEMO_SERVICE_URL", defaultNemoURL),
-		PresidioURL:      getEnv("PRESIDIO_SERVICE_URL", defaultPresidioURL),
-		DetectionTimeout: time.Duration(timeoutMs) * time.Millisecond,
-		LLMTimeout:       time.Duration(llmTimeoutMs) * time.Millisecond,
-		TelemetryTimeout: time.Duration(telemetryTimeoutMS) * time.Millisecond,
-		OpenAIURL:        getEnv("OPENAI_API_URL", defaultOpenAIURL),
-		AnthropicURL:     getEnv("ANTHROPIC_API_URL", defaultAnthropicURL),
-		GeminiBaseURL:    getEnv("GEMINI_API_BASE_URL", defaultGeminiBaseURL),
-		OpenAIAPIKey:     strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
-		AnthropicAPIKey:  strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
-		GeminiAPIKey:     strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
-		TelemetryURL:     normalizeDashboardURL(strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_DASHBOARD_URL"), os.Getenv("INTERTRACE_TELEMETRY_URL")))),
-		TelemetryAuth:    strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_INTERNAL_SECRET"), os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN"))),
-		OrgKeyID:         strings.TrimSpace(os.Getenv("INTERTRACE_ORG_KEY_ID")),
-		OrgSecret:        strings.TrimSpace(os.Getenv("INTERTRACE_ORG_SECRET")),
-		OrgSecretMap:     parseEnvStringMap("INTERTRACE_ORG_SECRET_MAP"),
-		OrgKeyIDMap:      parseEnvStringMap("INTERTRACE_ORG_KEY_ID_MAP"),
-		IngestQueueSize:  ingestQueueSize,
-		IngestWorkers:    ingestWorkers,
-		IngestRetries:    ingestRetries,
-		FailClosed:       parseEnvBool("FAIL_CLOSED", defaultFailClosed),
-		EnableNemo:       parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
-		EnablePresidio:   parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
-		EnableTelemetry:  enableDashboardIngest,
-		ForwardAuth:      parseEnvBool("INTERTRACE_TELEMETRY_FORWARD_AUTH", true),
-		DebugDetection:   parseEnvBool("DEBUG_DETECTION", defaultDebugMode),
-		MaxBodyBytes:     maxBodyBytes,
+		NemoServiceURL:         getEnv("NEMO_SERVICE_URL", defaultNemoURL),
+		PresidioURL:            getEnv("PRESIDIO_SERVICE_URL", defaultPresidioURL),
+		DetectionTimeout:       time.Duration(timeoutMs) * time.Millisecond,
+		DetectionRetries:       detectionRetries,
+		RetryBackoff:           time.Duration(retryBackoffMS) * time.Millisecond,
+		LLMTimeout:             time.Duration(llmTimeoutMs) * time.Millisecond,
+		TelemetryTimeout:       time.Duration(telemetryTimeoutMS) * time.Millisecond,
+		OpenAIURL:              getEnv("OPENAI_API_URL", defaultOpenAIURL),
+		AnthropicURL:           getEnv("ANTHROPIC_API_URL", defaultAnthropicURL),
+		GeminiBaseURL:          getEnv("GEMINI_API_BASE_URL", defaultGeminiBaseURL),
+		OpenAIAPIKey:           strings.TrimSpace(os.Getenv("OPENAI_API_KEY")),
+		AnthropicAPIKey:        strings.TrimSpace(os.Getenv("ANTHROPIC_API_KEY")),
+		GeminiAPIKey:           strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
+		TelemetryURL:           normalizeDashboardURL(strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_DASHBOARD_URL"), os.Getenv("INTERTRACE_TELEMETRY_URL")))),
+		TelemetryAuth:          strings.TrimSpace(firstNonEmpty(os.Getenv("INTERTRACE_INTERNAL_SECRET"), os.Getenv("INTERTRACE_TELEMETRY_AUTH_TOKEN"))),
+		OrgKeyID:               strings.TrimSpace(os.Getenv("INTERTRACE_ORG_KEY_ID")),
+		OrgSecret:              strings.TrimSpace(os.Getenv("INTERTRACE_ORG_SECRET")),
+		OrgSecretMap:           parseEnvStringMap("INTERTRACE_ORG_SECRET_MAP"),
+		OrgKeyIDMap:            parseEnvStringMap("INTERTRACE_ORG_KEY_ID_MAP"),
+		IngestQueueSize:        ingestQueueSize,
+		IngestWorkers:          ingestWorkers,
+		IngestRetries:          ingestRetries,
+		FailClosed:             parseEnvBool("FAIL_CLOSED", defaultFailClosed),
+		EnableNemo:             parseEnvBool("ENABLE_NEMO", defaultEnableNemo),
+		EnablePresidio:         parseEnvBool("ENABLE_PRESIDIO", defaultEnablePii),
+		EnableTelemetry:        enableDashboardIngest,
+		EnableDegradedFallback: parseEnvBool("ENABLE_DEGRADED_FALLBACK", true),
+		DegradedSafeDecision:   degradedSafeDecision,
+		ForwardAuth:            parseEnvBool("INTERTRACE_TELEMETRY_FORWARD_AUTH", true),
+		DebugDetection:         parseEnvBool("DEBUG_DETECTION", defaultDebugMode),
+		MaxBodyBytes:           maxBodyBytes,
 	}
 }
 
@@ -681,6 +752,21 @@ func parseEnvBool(key string, defaultValue bool) bool {
 		return false
 	default:
 		return defaultValue
+	}
+}
+
+func isRetryableStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests || statusCode == http.StatusRequestTimeout || statusCode >= http.StatusInternalServerError
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 

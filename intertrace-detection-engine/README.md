@@ -187,8 +187,12 @@ PORT=8080
 NEMO_SERVICE_URL=http://nemo-guardrails:8001/detect
 PRESIDIO_SERVICE_URL=http://presidio:8002/detect
 DETECTION_TIMEOUT_MS=2500
+DETECTION_RETRIES=1
+DETECTION_RETRY_BACKOFF_MS=120
 LLM_TIMEOUT_MS=45000
 FAIL_CLOSED=true
+ENABLE_DEGRADED_FALLBACK=true
+DEGRADED_SAFE_DECISION=review
 ENABLE_NEMO=true
 ENABLE_PRESIDIO=true
 DEBUG_DETECTION=false
@@ -221,6 +225,10 @@ Intertrace dashboard telemetry:
   - Shared secret mode: `INTERTRACE_INTERNAL_SECRET`
   - Org-key mode (preferred): `INTERTRACE_ORG_KEY_ID` + `INTERTRACE_ORG_SECRET` (or per-org maps via `INTERTRACE_ORG_KEY_ID_MAP` and `INTERTRACE_ORG_SECRET_MAP`).
 - Payload includes the required minimum fields (`org_id`, `provider`, `model`, `inbound_verdict`, `outbound_verdict`, `threats`, `pii_detected`, `latency_gateway_ms`) plus recommended context fields (`asset_id`, `request_id`, `gateway_route`, classifier metadata, redacted prompt/response fields, timing breakdowns).
+- Detector resiliency:
+  - `DETECTION_RETRIES` + `DETECTION_RETRY_BACKOFF_MS` retry transient detector failures (timeouts, 429, 5xx) before counting a detector as failed.
+  - `ENABLE_DEGRADED_FALLBACK=true` applies an emergency local classifier only when both detectors fail and `FAIL_CLOSED=true`.
+  - In degraded mode, obvious jailbreak/secret-exfiltration indicators remain blocked, while benign prompts downgrade to `DEGRADED_SAFE_DECISION` (`review` by default, or `allow`).
 
 Presidio service:
 
